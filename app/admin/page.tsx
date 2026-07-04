@@ -1,6 +1,3 @@
-'use client';
-
-import { useEffect, useState } from 'react';
 
 interface Reservation {
   servicio: string;
@@ -10,58 +7,84 @@ interface Reservation {
   chatId: number;
 }
 
-export default function AdminPage() {
-  const [reservations, setReservations] = useState<Reservation[]>([]);
-  const [loading, setLoading] = useState(true);
+async function getReservations() {
+  try {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000'}/api/admin/reservations`, {
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    return data.reservations || [];
+  } catch (error) {
+    console.error('Error fetching reservations:', error);
+    return [];
+  }
+}
 
-  useEffect(() => {
-    async function fetchReservations() {
-      try {
-        const res = await fetch('/api/admin/reservations');
-        const data = await res.json();
-        setReservations(data.reservations || []);
-      } catch (error) {
-        console.error('Error fetching reservations:', error);
-      } finally {
-        setLoading(false);
-      }
-    }
-    fetchReservations();
-  }, []);
+export default async function AdminPage() {
+  const reservations = await getReservations();
 
   return (
-    <div className="min-h-screen p-6 bg-gray-50 dark:bg-gray-900">
-      <div className="max-w-6xl mx-auto">
-        <h1 className="text-3xl font-bold mb-8 text-gray-900 dark:text-white">
+    <div style={{
+      minHeight: '100vh',
+      padding: '24px',
+      backgroundColor: '#f9fafb',
+    }}>
+      <div style={{
+        maxWidth: '1200px',
+        margin: '0 auto',
+      }}>
+        <h1 style={{
+          fontSize: '30px',
+          fontWeight: 'bold',
+          marginBottom: '32px',
+          color: '#111827',
+        }}>
           Panel de Administración
         </h1>
 
-        <div className="mb-8">
-          <h2 className="text-2xl font-semibold mb-4 text-gray-800 dark:text-gray-100">
+        <div style={{ marginBottom: '32px' }}>
+          <h2 style={{
+            fontSize: '24px',
+            fontWeight: '600',
+            marginBottom: '16px',
+            color: '#1f2937',
+          }}>
             Reservas
           </h2>
-          
-          {loading ? (
-            <p className="text-gray-600 dark:text-gray-400">Cargando reservas...</p>
-          ) : reservations.length === 0 ? (
-            <p className="text-gray-600 dark:text-gray-400">No hay reservas aún.</p>
+
+          {reservations.length === 0 ? (
+            <p style={{ color: '#4b5563' }}>No hay reservas aún.</p>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(1, 1fr)',
+              gap: '16px',
+            }}>
               {reservations.map((res, index) => (
                 <div
                   key={index}
-                  className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow"
+                  style={{
+                    padding: '24px',
+                    backgroundColor: '#ffffff',
+                    borderRadius: '8px',
+                    boxShadow: '0 1px 3px 0 rgba(0,0,0,0.1)',
+                  }}
                 >
-                  <h3 className="text-xl font-bold text-gray-900 dark:text-white mb-2">
+                  <h3 style={{
+                    fontSize: '20px',
+                    fontWeight: 'bold',
+                    color: '#111827',
+                    marginBottom: '8px',
+                  }}>
                     {res.servicio}
                   </h3>
-                  <p className="text-gray-700 dark:text-gray-300 mb-1">
+                  <p style={{ color: '#374151', marginBottom: '4px' }}>
                     <strong>Cliente:</strong> {res.nombre}
                   </p>
-                  <p className="text-gray-700 dark:text-gray-300 mb-1">
+                  <p style={{ color: '#374151', marginBottom: '4px' }}>
                     <strong>Fecha:</strong> {res.fecha}
                   </p>
-                  <p className="text-gray-700 dark:text-gray-300">
+                  <p style={{ color: '#374151' }}>
                     <strong>Hora:</strong> {res.hora}
                   </p>
                 </div>
