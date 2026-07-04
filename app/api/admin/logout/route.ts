@@ -17,6 +17,11 @@ export async function POST(request: NextRequest) {
     } catch { /* ignorar errores al cerrar sesión */ }
   }
 
+  if (token) {
+    const { removeLocalSession } = require('@/lib/auth');
+    removeLocalSession(token);
+  }
+
   cookieStore.delete('admin_session');
   // También borrar cookie antigua por compatibilidad
   cookieStore.delete('admin_authenticated');

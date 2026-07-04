@@ -67,7 +67,7 @@ function generateId(): string {
 }
 
 // Función para verificar disponibilidad (solo con KV)
-async function verificarDisponibilidad(fechaStr: string, horaStr: string) {
+async function verificarDisponibilidad(servicio: string, fechaStr: string, horaStr: string) {
   try {
     const fecha = new Date(fechaStr);
     const dia = fecha.getDay();
@@ -82,19 +82,19 @@ async function verificarDisponibilidad(fechaStr: string, horaStr: string) {
       return { disponible: false, mensaje: 'Horario no disponible. Escoge entre: ' + horariosDisponibles.join(', ') };
     }
     
-    // 3. Verificar en la BD si ya está reservado
-    const key = `reserva:${fechaStr}:${horaStr}`;
+    // 3. Verificar en la BD si ya está reservado ese servicio específico en esa fecha y hora
+    const key = `reserva:${servicio}:${fechaStr}:${horaStr}`;
     let reservaExistente = null;
     
     if (kv) {
       reservaExistente = await kv.get(key);
     } else {
       const localReservations = getLocalReservations();
-      reservaExistente = localReservations.find(r => r.fecha === fechaStr && r.hora === horaStr);
+      reservaExistente = localReservations.find(r => r.servicio === servicio && r.fecha === fechaStr && r.hora === horaStr);
     }
     
     if (reservaExistente) {
-      return { disponible: false, mensaje: 'Lo siento, ese horario ya está reservado.' };
+      return { disponible: false, mensaje: `Lo siento, ese horario ya está reservado para ${servicio}.` };
     }
     
     return { disponible: true };
@@ -109,7 +109,7 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
   try {
     const id = generateId();
     const reserva: Reservation = { ...datos, id };
-    const key = `reserva:${datos.fecha}:${datos.hora}`;
+    const key = `reserva:${datos.servicio}:${datos.fecha}:${datos.hora}`;
     const idKey = `reserva:id:${id}`;
     
     if (kv) {
@@ -138,7 +138,7 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
 async function eliminarReserva(chatId: number, reservaId: string) {
   try {
     if (kv) {
-      // Obtener la reserva primero para conocer fecha y hora
+      // Obtener la reserva primero para conocer fecha, hora y servicio
       const idKey = `reserva:id:${reservaId}`;
       const reservaData = await kv.get(idKey);
       if (!reservaData) return false;
@@ -146,7 +146,7 @@ async function eliminarReserva(chatId: number, reservaId: string) {
       const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
       
       // Eliminar todas las referencias
-      const key = `reserva:${reserva.fecha}:${reserva.hora}`;
+      const key = `reserva:${reserva.servicio}:${reserva.fecha}:${reserva.hora}`;
       await kv.del(key);
       await kv.del(idKey);
       
@@ -157,7 +157,12 @@ async function eliminarReserva(chatId: number, reservaId: string) {
       reservasArray = reservasArray.filter((r: Reservation) => r.id !== reservaId);
       await kv.set(userKey, JSON.stringify(reservasArray));
     } else {
-      // TODO: Implementar delete en memoria local
+      // Eliminar de memoria local
+      const localReservations = getLocalReservations();
+      const index = localReservations.findIndex(r => r.id === reservaId);
+      if (index !== -1) {
+        localReservations.splice(index, 1);
+      }
     }
     
     return true;
@@ -306,7 +311,7 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(`${servicioSeleccionado} ✔️ ¿Cuál es tu nombre?`);
       } else if (data.startsWith('hora:')) {
         const horaSeleccionada = data.replace('hora:', '');
-        const disponibilidad = await verificarDisponibilidad(estado.fecha!, horaSeleccionada);
+        const disponibilidad = await verificarDisponibilidad(estado.servicio!, estado.fecha!, horaSeleccionada);
             
         if (disponibilidad.disponible) {
           // Guardar reserva
@@ -552,7 +557,7 @@ export async function POST(request: NextRequest) {
           }
 
           if (horaSeleccionada) {
-            const disponibilidad = await verificarDisponibilidad(estado.fecha!, horaSeleccionada);
+            const disponibilidad = await verificarDisponibilidad(estado.servicio!, estado.fecha!, horaSeleccionada);
             
             if (disponibilidad.disponible) {
               const datosReserva = {

@@ -1,11 +1,18 @@
 import { cookies } from 'next/headers';
 import { createClient } from '@vercel/kv';
 
-// Tokens de sesión en memoria para desarrollo local
-const localSessions = new Set<string>();
+// Variable global para persistir las sesiones en memoria local durante el desarrollo de Next.js
+const globalSessions = (global as any)._localSessions || new Set<string>();
+if (!(global as any)._localSessions) {
+  (global as any)._localSessions = globalSessions;
+}
 
 export function addLocalSession(token: string) {
-  localSessions.add(token);
+  globalSessions.add(token);
+}
+
+export function removeLocalSession(token: string) {
+  globalSessions.delete(token);
 }
 
 export async function isAuthenticated(): Promise<boolean> {
@@ -14,7 +21,12 @@ export async function isAuthenticated(): Promise<boolean> {
 
   if (!token) return false;
 
-  // Si hay KV, validar el token contra la BD
+  // Si el token está registrado en la memoria local (desarrollo), lo damos por válido
+  if (globalSessions.has(token)) {
+    return true;
+  }
+
+  // Si hay KV, validar el token contra la BD (producción)
   if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
     try {
       const kv = createClient({
@@ -28,6 +40,6 @@ export async function isAuthenticated(): Promise<boolean> {
     }
   }
 
-  // Fallback para desarrollo: aceptar cualquier token no vacío
+  // Fallback de desarrollo para cualquier token válido
   return token.length === 64;
 }

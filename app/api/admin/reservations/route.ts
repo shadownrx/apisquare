@@ -103,7 +103,7 @@ export async function DELETE(request: NextRequest) {
     const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
 
     // Eliminar todas las referencias
-    const key = `reserva:${reserva.fecha}:${reserva.hora}`;
+    const key = `reserva:${reserva.servicio}:${reserva.fecha}:${reserva.hora}`;
     await kv.del(key);
     await kv.del(idKey);
 
