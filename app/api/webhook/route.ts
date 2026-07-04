@@ -66,35 +66,63 @@ function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
-// Función para verificar disponibilidad (solo con KV)
-async function verificarDisponibilidad(servicio: string, fechaStr: string, horaStr: string) {
+function slotKey(fechaStr: string, horaStr: string): string {
+  return `reserva:slot:${fechaStr}:${horaStr}`;
+}
+
+function legacySlotKey(servicio: string, fechaStr: string, horaStr: string): string {
+  return `reserva:${servicio}:${fechaStr}:${horaStr}`;
+}
+
+async function obtenerReservaEnSlot(fechaStr: string, horaStr: string): Promise<Reservation | null> {
+  if (kv) {
+    const data = await kv.get(slotKey(fechaStr, horaStr));
+    if (data) {
+      return typeof data === 'string' ? JSON.parse(data) : data;
+    }
+    // Compatibilidad con reservas guardadas con el formato anterior
+    for (const servicio of servicios) {
+      const legacy = await kv.get(legacySlotKey(servicio, fechaStr, horaStr));
+      if (legacy) {
+        return typeof legacy === 'string' ? JSON.parse(legacy) : legacy;
+      }
+    }
+    return null;
+  }
+
+  const localReservations = getLocalReservations();
+  return localReservations.find(r => r.fecha === fechaStr && r.hora === horaStr) ?? null;
+}
+
+async function obtenerHorariosLibres(fechaStr: string): Promise<string[]> {
+  const libres: string[] = [];
+  for (const hora of horariosDisponibles) {
+    const ocupado = await obtenerReservaEnSlot(fechaStr, hora);
+    if (!ocupado) libres.push(hora);
+  }
+  return libres;
+}
+
+// Verifica que el turno esté libre (un solo turno por fecha+hora, sin importar la especialidad)
+async function verificarDisponibilidad(_servicio: string, fechaStr: string, horaStr: string) {
   try {
     const fecha = new Date(fechaStr);
     const dia = fecha.getDay();
     
-    // 1. Verificar si es día laborable
     if (!diasLaborables.includes(dia)) {
       return { disponible: false, mensaje: 'Lo siento, no atendemos ese día.' };
     }
     
-    // 2. Verificar si el horario está disponible
     if (!horariosDisponibles.includes(horaStr)) {
       return { disponible: false, mensaje: 'Horario no disponible. Escoge entre: ' + horariosDisponibles.join(', ') };
     }
     
-    // 3. Verificar en la BD si ya está reservado ese servicio específico en esa fecha y hora
-    const key = `reserva:${servicio}:${fechaStr}:${horaStr}`;
-    let reservaExistente = null;
-    
-    if (kv) {
-      reservaExistente = await kv.get(key);
-    } else {
-      const localReservations = getLocalReservations();
-      reservaExistente = localReservations.find(r => r.servicio === servicio && r.fecha === fechaStr && r.hora === horaStr);
-    }
-    
+    const reservaExistente = await obtenerReservaEnSlot(fechaStr, horaStr);
     if (reservaExistente) {
-      return { disponible: false, mensaje: `Lo siento, ese horario ya está reservado para ${servicio}.` };
+      return {
+        disponible: false,
+        mensaje: `Lo siento, ese horario (${horaStr}) ya está ocupado. Elegí otro turno disponible.`
+      };
     }
     
     return { disponible: true };
@@ -109,11 +137,17 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
   try {
     const id = generateId();
     const reserva: Reservation = { ...datos, id };
-    const key = `reserva:${datos.servicio}:${datos.fecha}:${datos.hora}`;
+    const key = slotKey(datos.fecha, datos.hora);
     const idKey = `reserva:id:${id}`;
     
     if (kv) {
-      await kv.set(key, JSON.stringify(reserva), { ex: 86400 * 30 }); // Expirar en 30 días
+      const existente = await obtenerReservaEnSlot(datos.fecha, datos.hora);
+      if (existente) {
+        console.log(`[DUPLICADO EVITADO] Ya existe reserva en ${key}`);
+        return null;
+      }
+
+      await kv.set(key, JSON.stringify(reserva), { ex: 86400 * 30 });
       await kv.set(idKey, JSON.stringify(reserva), { ex: 86400 * 30 });
       
       // Guardar también por usuario
@@ -124,6 +158,11 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
       await kv.set(userKey, JSON.stringify(reservasArray));
     } else {
       // Almacenar en memoria para desarrollo local
+      const existente = await obtenerReservaEnSlot(datos.fecha, datos.hora);
+      if (existente) {
+        console.log(`[DUPLICADO EVITADO LOCAL] Ya existe reserva en ${datos.fecha} ${datos.hora}`);
+        return null;
+      }
       addLocalReservation(reserva);
     }
     
@@ -145,9 +184,8 @@ async function eliminarReserva(chatId: number, reservaId: string) {
       
       const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
       
-      // Eliminar todas las referencias
-      const key = `reserva:${reserva.servicio}:${reserva.fecha}:${reserva.hora}`;
-      await kv.del(key);
+      await kv.del(slotKey(reserva.fecha, reserva.hora));
+      await kv.del(legacySlotKey(reserva.servicio, reserva.fecha, reserva.hora));
       await kv.del(idKey);
       
       // Eliminar de la lista del usuario
@@ -339,10 +377,16 @@ export async function POST(request: NextRequest) {
               ]
             );
           } else {
-            await sendWithKeyboard('Ups, hubo un error. ¿Quieres intentar de nuevo?', [[{ text: '🔄 Sí', callback_data: 'reservar' }]]);
+            await sendWithKeyboard(
+              'Ese horario acaba de ser reservado. ¿Querés elegir otro?',
+              [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+            );
           }
         } else {
-          await sendWithKeyboard(`Lo siento, ese horario no está disponible. ¿Quieres elegir otro?`, [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]);
+          await sendWithKeyboard(
+            disponibilidad.mensaje || 'Lo siento, ese horario no está disponible. ¿Quieres elegir otro?',
+            [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+          );
         }
       } else if (data === 'noop') {
         // No hacer nada
@@ -420,18 +464,30 @@ export async function POST(request: NextRequest) {
         );
       };
 
-      // Helper para mostrar horarios con botones
-      const showHorarios = async () => {
-        const keyboard = [];
-        for (let i = 0; i < horariosDisponibles.length; i += 3) {
-          keyboard.push([
-            horariosDisponibles[i], horariosDisponibles[i+1], horariosDisponibles[i+2]
-          ].filter(Boolean).map(h => ({ text: h, callback_data: `hora:${h}` })));
+      // Helper para mostrar solo horarios libres en la fecha elegida
+      const showHorarios = async (fechaStr: string) => {
+        const horariosLibres = await obtenerHorariosLibres(fechaStr);
+
+        if (horariosLibres.length === 0) {
+          await sendWithKeyboard(
+            'No hay turnos disponibles ese día. Probá con otra fecha (AAAA-MM-DD).',
+            [[{ text: '🔄 Elegir otra fecha', callback_data: 'reservar' }]]
+          );
+          await saveState({
+            paso: 'fecha',
+            servicio: estado.servicio,
+            nombre: estado.nombre
+          });
+          return;
         }
-        await sendWithKeyboard(
-          '¿Qué horario te conviene?',
-          keyboard
-        );
+
+        const keyboard = [];
+        for (let i = 0; i < horariosLibres.length; i += 3) {
+          keyboard.push(
+            horariosLibres.slice(i, i + 3).map(h => ({ text: h, callback_data: `hora:${h}` }))
+          );
+        }
+        await sendWithKeyboard('¿Qué horario te conviene?', keyboard);
       };
 
       // Comandos conversacionales (con y sin "/")
@@ -536,24 +592,21 @@ export async function POST(request: NextRequest) {
             nombre: estado.nombre,
             fecha: text
           });
-          await showHorarios();
+          await showHorarios(text);
         }
 
         // Paso 4: Obtener hora y confirmar (si no es por botón)
         else if (estado.paso === 'hora') {
           let horaSeleccionada = null;
+          const horariosLibres = await obtenerHorariosLibres(estado.fecha!);
           
-          // Intentar encontrar por número
           const num = parseInt(text);
-          if (!isNaN(num) && num >= 1 && num <= horariosDisponibles.length) {
-            horaSeleccionada = horariosDisponibles[num - 1];
-          }
-          
-          // Intentar encontrar por texto
-          else {
-            horaSeleccionada = horariosDisponibles.find(h => 
+          if (!isNaN(num) && num >= 1 && num <= horariosLibres.length) {
+            horaSeleccionada = horariosLibres[num - 1];
+          } else {
+            horaSeleccionada = horariosLibres.find(h => 
               h.includes(text) || text.includes(h)
-            );
+            ) ?? null;
           }
 
           if (horaSeleccionada) {
@@ -584,13 +637,19 @@ export async function POST(request: NextRequest) {
                   ]
                 );
               } else {
-                await sendWithKeyboard('Ups, hubo un error. ¿Quieres intentar de nuevo?', [[{ text: '🔄 Sí', callback_data: 'reservar' }]]);
+                await sendWithKeyboard(
+                  'Ese horario acaba de ser reservado. ¿Querés elegir otro?',
+                  [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+                );
               }
             } else {
-              await sendWithKeyboard(`Lo siento, ese horario no está disponible. ¿Quieres elegir otro?`, [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]);
+              await sendWithKeyboard(
+                disponibilidad.mensaje || 'Lo siento, ese horario no está disponible. ¿Quieres elegir otro?',
+                [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+              );
             }
           } else {
-            await showHorarios();
+            await showHorarios(estado.fecha!);
           }
         }
       }
