@@ -53,10 +53,21 @@ module.exports = async (req, res) => {
       return res.status(200).json({ status: 'Bot webhook activo. Esperando POSTs de Telegram.' });
     }
 
-    bot.processUpdate(req.body);
+    // Asegurarse de tener el body parseado
+    const update = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+
+    if (update) {
+      // Usar una promesa para no finalizar la petición antes de que Telegram Bot termine de procesarla
+      await new Promise((resolve) => {
+        bot.processUpdate(update);
+        // Damos un pequeño margen para que se completen las llamadas HTTP salientes
+        setTimeout(resolve, 1500);
+      });
+    }
+
     return res.status(200).send('OK');
   } catch (error) {
     console.error('Error procesando update de Telegram:', error);
-    return res.status(500).json({ error: 'Error interno del servidor' });
+    return res.status(500).json({ error: 'Error interno del servidor', details: error.message });
   }
 };
