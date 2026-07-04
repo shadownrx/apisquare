@@ -102,8 +102,8 @@ export async function DELETE(request: NextRequest) {
 
     const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
 
-    await kv.del(`reserva:slot:${reserva.fecha}:${reserva.hora}`);
-    await kv.del(`reserva:${reserva.servicio}:${reserva.fecha}:${reserva.hora}`);
+    const key = `reserva:${reserva.servicio}:${reserva.fecha}:${reserva.hora}`;
+    await kv.del(key);
     await kv.del(idKey);
 
     // Eliminar de la lista del usuario

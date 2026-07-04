@@ -61,52 +61,174 @@ function formatDate(fechaStr: string): string {
   return fecha.toLocaleDateString('es-ES', options);
 }
 
+function toDateStr(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function getToday(): Date {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+function addDays(date: Date, days: number): Date {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function proximosDiasLaborables(cantidad: number): { fecha: string; label: string }[] {
+  const dias: { fecha: string; label: string }[] = [];
+  const today = getToday();
+  let offset = 0;
+
+  while (dias.length < cantidad && offset < 30) {
+    const candidate = addDays(today, offset);
+    if (diasLaborables.includes(candidate.getDay())) {
+      let label: string;
+      if (offset === 0) label = 'Hoy';
+      else if (offset === 1) label = 'Mañana';
+      else {
+        label = candidate.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' });
+        label = label.charAt(0).toUpperCase() + label.slice(1);
+      }
+      dias.push({ fecha: toDateStr(candidate), label });
+    }
+    offset++;
+  }
+  return dias;
+}
+
+function buildFechasKeyboard() {
+  const dias = proximosDiasLaborables(8);
+  const keyboard = [];
+  for (let i = 0; i < dias.length; i += 2) {
+    keyboard.push(
+      dias.slice(i, i + 2).map(d => ({
+        text: d.label,
+        callback_data: `fecha:${d.fecha}`
+      }))
+    );
+  }
+  keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
+  return keyboard;
+}
+
+function buildFechasView(servicio?: string) {
+  return {
+    text: servicio
+      ? `¿Qué día preferís para ${servicio}?`
+      : '¿Qué día te gustaría?',
+    keyboard: buildFechasKeyboard()
+  };
+}
+
+function parseFecha(text: string): string | null {
+  const normalized = text.toLowerCase().trim();
+  const today = getToday();
+
+  if (['hoy', 'today'].includes(normalized)) return toDateStr(today);
+  if (['mañana', 'manana', 'tomorrow'].includes(normalized)) return toDateStr(addDays(today, 1));
+  if (['pasado mañana', 'pasado manana'].includes(normalized)) return toDateStr(addDays(today, 2));
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return normalized;
+
+  const slashMatch = normalized.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
+  if (slashMatch) {
+    const day = parseInt(slashMatch[1], 10);
+    const month = parseInt(slashMatch[2], 10);
+    const year = slashMatch[3] ? parseInt(slashMatch[3], 10) : today.getFullYear();
+    const d = new Date(year, month - 1, day);
+    if (!isNaN(d.getTime())) return toDateStr(d);
+  }
+
+  return null;
+}
+
+function esDiaLaborable(fechaStr: string): boolean {
+  const dia = new Date(fechaStr + 'T12:00:00').getDay();
+  return diasLaborables.includes(dia);
+}
+
 // Función para generar ID único
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
-function slotKey(fechaStr: string, horaStr: string): string {
-  return `reserva:slot:${fechaStr}:${horaStr}`;
-}
-
-function legacySlotKey(servicio: string, fechaStr: string, horaStr: string): string {
+function reservaKey(servicio: string, fechaStr: string, horaStr: string): string {
   return `reserva:${servicio}:${fechaStr}:${horaStr}`;
 }
 
-async function obtenerReservaEnSlot(fechaStr: string, horaStr: string): Promise<Reservation | null> {
+async function obtenerReservaEnSlot(servicio: string, fechaStr: string, horaStr: string): Promise<Reservation | null> {
   if (kv) {
-    const data = await kv.get(slotKey(fechaStr, horaStr));
+    const data = await kv.get(reservaKey(servicio, fechaStr, horaStr));
     if (data) {
       return typeof data === 'string' ? JSON.parse(data) : data;
-    }
-    // Compatibilidad con reservas guardadas con el formato anterior
-    for (const servicio of servicios) {
-      const legacy = await kv.get(legacySlotKey(servicio, fechaStr, horaStr));
-      if (legacy) {
-        return typeof legacy === 'string' ? JSON.parse(legacy) : legacy;
-      }
     }
     return null;
   }
 
   const localReservations = getLocalReservations();
-  return localReservations.find(r => r.fecha === fechaStr && r.hora === horaStr) ?? null;
+  return localReservations.find(
+    r => r.servicio === servicio && r.fecha === fechaStr && r.hora === horaStr
+  ) ?? null;
 }
 
-async function obtenerHorariosLibres(fechaStr: string): Promise<string[]> {
+async function obtenerHorariosLibres(fechaStr: string, servicio: string): Promise<string[]> {
   const libres: string[] = [];
   for (const hora of horariosDisponibles) {
-    const ocupado = await obtenerReservaEnSlot(fechaStr, hora);
+    const ocupado = await obtenerReservaEnSlot(servicio, fechaStr, hora);
     if (!ocupado) libres.push(hora);
   }
   return libres;
 }
 
-// Verifica que el turno esté libre (un solo turno por fecha+hora, sin importar la especialidad)
-async function verificarDisponibilidad(_servicio: string, fechaStr: string, horaStr: string) {
+function otrasEspecialidadesKeyboard(servicioActual: string) {
+  const keyboard = servicios
+    .filter(s => s !== servicioActual)
+    .map(s => [{ text: s, callback_data: `servicio:${s}` }]);
+  keyboard.push(
+    [{ text: '🔄 Otros horarios', callback_data: 'refresh_horarios' }],
+    [{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }]
+  );
+  return keyboard;
+}
+
+async function buildHorariosView(fechaStr: string, servicio: string) {
+  const horariosLibres = await obtenerHorariosLibres(fechaStr, servicio);
+
+  if (horariosLibres.length === 0) {
+    const otras = servicios.filter(s => s !== servicio);
+    return {
+      text:
+        `No hay turnos libres para ${servicio} el ${formatDate(fechaStr)}.\n\n` +
+        `Otra especialidad puede tener disponibilidad ese día:`,
+      keyboard: [
+        ...otras.map(s => [{ text: s, callback_data: `servicio:${s}` }]),
+        [{ text: '📅 Elegir otra fecha', callback_data: 'cambiar_fecha' }],
+        [{ text: '🏠 Menú', callback_data: 'menu' }]
+      ]
+    };
+  }
+
+  const keyboard = [];
+  for (let i = 0; i < horariosLibres.length; i += 3) {
+    keyboard.push(
+      horariosLibres.slice(i, i + 3).map(h => ({ text: h, callback_data: `hora:${h}` }))
+    );
+  }
+
+  return {
+    text: `Turnos disponibles para ${servicio} (${formatDate(fechaStr)}):`,
+    keyboard
+  };
+}
+
+async function verificarDisponibilidad(servicio: string, fechaStr: string, horaStr: string) {
   try {
-    const fecha = new Date(fechaStr);
+    const fecha = new Date(fechaStr + 'T12:00:00');
     const dia = fecha.getDay();
     
     if (!diasLaborables.includes(dia)) {
@@ -117,11 +239,11 @@ async function verificarDisponibilidad(_servicio: string, fechaStr: string, hora
       return { disponible: false, mensaje: 'Horario no disponible. Escoge entre: ' + horariosDisponibles.join(', ') };
     }
     
-    const reservaExistente = await obtenerReservaEnSlot(fechaStr, horaStr);
+    const reservaExistente = await obtenerReservaEnSlot(servicio, fechaStr, horaStr);
     if (reservaExistente) {
       return {
         disponible: false,
-        mensaje: `Lo siento, ese horario (${horaStr}) ya está ocupado. Elegí otro turno disponible.`
+        mensaje: `Ese horario ya está reservado para ${servicio}. Podés elegir otro horario u otra especialidad.`
       };
     }
     
@@ -137,11 +259,11 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
   try {
     const id = generateId();
     const reserva: Reservation = { ...datos, id };
-    const key = slotKey(datos.fecha, datos.hora);
+    const key = reservaKey(datos.servicio, datos.fecha, datos.hora);
     const idKey = `reserva:id:${id}`;
     
     if (kv) {
-      const existente = await obtenerReservaEnSlot(datos.fecha, datos.hora);
+      const existente = await obtenerReservaEnSlot(datos.servicio, datos.fecha, datos.hora);
       if (existente) {
         console.log(`[DUPLICADO EVITADO] Ya existe reserva en ${key}`);
         return null;
@@ -158,7 +280,7 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
       await kv.set(userKey, JSON.stringify(reservasArray));
     } else {
       // Almacenar en memoria para desarrollo local
-      const existente = await obtenerReservaEnSlot(datos.fecha, datos.hora);
+      const existente = await obtenerReservaEnSlot(datos.servicio, datos.fecha, datos.hora);
       if (existente) {
         console.log(`[DUPLICADO EVITADO LOCAL] Ya existe reserva en ${datos.fecha} ${datos.hora}`);
         return null;
@@ -184,8 +306,7 @@ async function eliminarReserva(chatId: number, reservaId: string) {
       
       const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
       
-      await kv.del(slotKey(reserva.fecha, reserva.hora));
-      await kv.del(legacySlotKey(reserva.servicio, reserva.fecha, reserva.hora));
+      await kv.del(reservaKey(reserva.servicio, reserva.fecha, reserva.hora));
       await kv.del(idKey);
       
       // Eliminar de la lista del usuario
@@ -345,8 +466,30 @@ export async function POST(request: NextRequest) {
         ]);
       } else if (data.startsWith('servicio:')) {
         const servicioSeleccionado = data.replace('servicio:', '');
-        await saveState({ paso: 'nombre', servicio: servicioSeleccionado });
-        await sendWithKeyboard(`${servicioSeleccionado} ✔️ ¿Cuál es tu nombre?`);
+        if (estado.nombre && estado.fecha) {
+          await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado });
+          const view = await buildHorariosView(estado.fecha, servicioSeleccionado);
+          await sendWithKeyboard(view.text, view.keyboard);
+        } else {
+          await saveState({ paso: 'nombre', servicio: servicioSeleccionado });
+          await sendWithKeyboard(`${servicioSeleccionado} ✔️ ¿Cuál es tu nombre?`);
+        }
+      } else if (data === 'cambiar_fecha') {
+        await saveState({ paso: 'fecha', servicio: estado.servicio, nombre: estado.nombre });
+        const view = buildFechasView(estado.servicio);
+        await sendWithKeyboard(view.text, view.keyboard);
+      } else if (data.startsWith('fecha:')) {
+        const fechaSeleccionada = data.replace('fecha:', '');
+        if (estado.servicio) {
+          await saveState({ ...estado, paso: 'hora', fecha: fechaSeleccionada });
+          const view = await buildHorariosView(fechaSeleccionada, estado.servicio);
+          await sendWithKeyboard(view.text, view.keyboard);
+        }
+      } else if (data === 'refresh_horarios') {
+        if (estado.fecha && estado.servicio) {
+          const view = await buildHorariosView(estado.fecha, estado.servicio);
+          await sendWithKeyboard(view.text, view.keyboard);
+        }
       } else if (data.startsWith('hora:')) {
         const horaSeleccionada = data.replace('hora:', '');
         const disponibilidad = await verificarDisponibilidad(estado.servicio!, estado.fecha!, horaSeleccionada);
@@ -378,14 +521,14 @@ export async function POST(request: NextRequest) {
             );
           } else {
             await sendWithKeyboard(
-              'Ese horario acaba de ser reservado. ¿Querés elegir otro?',
-              [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+              `Ese horario para ${estado.servicio} acaba de ser reservado.`,
+              otrasEspecialidadesKeyboard(estado.servicio!)
             );
           }
         } else {
           await sendWithKeyboard(
-            disponibilidad.mensaje || 'Lo siento, ese horario no está disponible. ¿Quieres elegir otro?',
-            [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+            disponibilidad.mensaje || 'Lo siento, ese horario no está disponible.',
+            otrasEspecialidadesKeyboard(estado.servicio!)
           );
         }
       } else if (data === 'noop') {
@@ -465,29 +608,15 @@ export async function POST(request: NextRequest) {
       };
 
       // Helper para mostrar solo horarios libres en la fecha elegida
-      const showHorarios = async (fechaStr: string) => {
-        const horariosLibres = await obtenerHorariosLibres(fechaStr);
-
-        if (horariosLibres.length === 0) {
-          await sendWithKeyboard(
-            'No hay turnos disponibles ese día. Probá con otra fecha (AAAA-MM-DD).',
-            [[{ text: '🔄 Elegir otra fecha', callback_data: 'reservar' }]]
-          );
-          await saveState({
-            paso: 'fecha',
-            servicio: estado.servicio,
-            nombre: estado.nombre
-          });
-          return;
-        }
-
-        const keyboard = [];
-        for (let i = 0; i < horariosLibres.length; i += 3) {
-          keyboard.push(
-            horariosLibres.slice(i, i + 3).map(h => ({ text: h, callback_data: `hora:${h}` }))
-          );
-        }
-        await sendWithKeyboard('¿Qué horario te conviene?', keyboard);
+      const showHorarios = async (fechaStr: string, servicio: string) => {
+        await saveState({
+          paso: 'hora',
+          servicio,
+          nombre: estado.nombre,
+          fecha: fechaStr
+        });
+        const view = await buildHorariosView(fechaStr, servicio);
+        await sendWithKeyboard(view.text, view.keyboard);
       };
 
       // Comandos conversacionales (con y sin "/")
@@ -581,24 +710,30 @@ export async function POST(request: NextRequest) {
             servicio: estado.servicio,
             nombre: text
           });
-          await sendWithKeyboard(`Hola ${text} 👋 ¿Qué día te gustaría? (Formato: AAAA-MM-DD)`);
+          const view = buildFechasView(estado.servicio);
+          await sendWithKeyboard(`Hola ${text} 👋 ${view.text}`, view.keyboard);
         }
 
         // Paso 3: Obtener fecha
         else if (estado.paso === 'fecha') {
-          await saveState({
-            paso: 'hora',
-            servicio: estado.servicio,
-            nombre: estado.nombre,
-            fecha: text
-          });
-          await showHorarios(text);
+          const fechaParseada = parseFecha(text);
+          if (fechaParseada && esDiaLaborable(fechaParseada)) {
+            await showHorarios(fechaParseada, estado.servicio!);
+          } else if (fechaParseada && !esDiaLaborable(fechaParseada)) {
+            await sendWithKeyboard(
+              'No atendemos fines de semana. Elegí un día de lunes a viernes:',
+              buildFechasKeyboard()
+            );
+          } else {
+            const view = buildFechasView(estado.servicio);
+            await sendWithKeyboard('Elegí un día de la lista:', view.keyboard);
+          }
         }
 
         // Paso 4: Obtener hora y confirmar (si no es por botón)
         else if (estado.paso === 'hora') {
           let horaSeleccionada = null;
-          const horariosLibres = await obtenerHorariosLibres(estado.fecha!);
+          const horariosLibres = await obtenerHorariosLibres(estado.fecha!, estado.servicio!);
           
           const num = parseInt(text);
           if (!isNaN(num) && num >= 1 && num <= horariosLibres.length) {
@@ -638,18 +773,18 @@ export async function POST(request: NextRequest) {
                 );
               } else {
                 await sendWithKeyboard(
-                  'Ese horario acaba de ser reservado. ¿Querés elegir otro?',
-                  [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+                  `Ese horario para ${estado.servicio} acaba de ser reservado.`,
+                  otrasEspecialidadesKeyboard(estado.servicio!)
                 );
               }
             } else {
               await sendWithKeyboard(
-                disponibilidad.mensaje || 'Lo siento, ese horario no está disponible. ¿Quieres elegir otro?',
-                [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]
+                disponibilidad.mensaje || 'Lo siento, ese horario no está disponible.',
+                otrasEspecialidadesKeyboard(estado.servicio!)
               );
             }
           } else {
-            await showHorarios(estado.fecha!);
+            await showHorarios(estado.fecha!, estado.servicio!);
           }
         }
       }
