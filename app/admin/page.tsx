@@ -1,4 +1,6 @@
 
+import { createClient } from '@vercel/kv';
+
 interface Reservation {
   servicio: string;
   nombre: string;
@@ -7,16 +9,36 @@ interface Reservation {
   chatId: number;
 }
 
-async function getReservations() {
+// Función para obtener reservas directamente (sin fetch)
+async function getReservations(): Promise<Reservation[]> {
   try {
-    const res = await fetch(`${process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000'}/api/admin/reservations`, {
-      cache: 'no-store',
+    // Verificar si KV está disponible
+    if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
+      // Si no hay KV (local), devolver datos de ejemplo
+      return [];
+    }
+
+    const kv = createClient({
+      url: process.env.KV_REST_API_URL,
+      token: process.env.KV_REST_API_TOKEN,
     });
-    const data = await res.json();
-    return data.reservations || [];
+
+    // Obtener todas las claves de reservas
+    const keys = await kv.keys('reserva:*');
+    const reservations: Reservation[] = [];
+
+    for (const key of keys) {
+      const value = await kv.get(key);
+      if (value) {
+        const reservation = typeof value === 'string' ? JSON.parse(value) : value;
+        reservations.push(reservation);
+      }
+    }
+
+    return reservations;
   } catch (error) {
     console.error('Error fetching reservations:', error);
-    return [];
+    return []; // Devolver array vacío en caso de error
   }
 }
 
@@ -57,7 +79,7 @@ export default async function AdminPage() {
           ) : (
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(1, 1fr)',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
               gap: '16px',
             }}>
               {reservations.map((res, index) => (
