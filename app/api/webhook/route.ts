@@ -331,6 +331,9 @@ async function eliminarReserva(chatId: number, reservaId: string) {
   }
 }
 
+// Set en memoria para deduplicar updates en entorno local
+const processedUpdates = new Set<number>();
+
 export async function POST(request: NextRequest) {
   console.log('=== NUEVA SOLICITUD ===');
 
@@ -342,6 +345,35 @@ export async function POST(request: NextRequest) {
 
     const update = await request.json();
     console.log('Update completo:', JSON.stringify(update, null, 2));
+
+    // ── Deduplicación por update_id ──────────────────────────────────────
+    // Telegram reintenta el webhook si no responde a tiempo.
+    // Guardamos el update_id y si ya fue procesado lo ignoramos.
+    const updateId: number | undefined = update?.update_id;
+    if (updateId !== undefined) {
+      const dedupKey = `processed:update:${updateId}`;
+      if (kv) {
+        const alreadyProcessed = await kv.get(dedupKey);
+        if (alreadyProcessed) {
+          console.log(`[DEDUP] Update ${updateId} ya procesado, ignorando.`);
+          return NextResponse.json({ status: 'ok' });
+        }
+        // Marcar como procesado con TTL de 10 minutos
+        await kv.set(dedupKey, '1', { ex: 600 });
+      } else {
+        if (processedUpdates.has(updateId)) {
+          console.log(`[DEDUP LOCAL] Update ${updateId} ya procesado, ignorando.`);
+          return NextResponse.json({ status: 'ok' });
+        }
+        processedUpdates.add(updateId);
+        // Limpiar entradas antiguas si crece demasiado
+        if (processedUpdates.size > 1000) {
+          const first = processedUpdates.values().next().value;
+          if (first !== undefined) processedUpdates.delete(first);
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────
 
     // Manejar callback queries (presionar botones)
     if (update.callback_query) {
@@ -520,15 +552,19 @@ export async function POST(request: NextRequest) {
               ]
             );
           } else {
+            // El slot fue tomado justo antes: mostrar horarios disponibles actualizados
+            const viewActualizada = await buildHorariosView(estado.fecha!, estado.servicio!);
             await sendWithKeyboard(
-              `Ese horario para ${estado.servicio} acaba de ser reservado.`,
-              otrasEspecialidadesKeyboard(estado.servicio!)
+              `⚠️ Ese horario acaba de ser reservado. Estos son los turnos disponibles para ${estado.servicio}:\n`,
+              viewActualizada.keyboard
             );
           }
         } else {
+          // Slot ya ocupado: mostrar horarios disponibles actualizados
+          const viewActualizada = await buildHorariosView(estado.fecha!, estado.servicio!);
           await sendWithKeyboard(
-            disponibilidad.mensaje || 'Lo siento, ese horario no está disponible.',
-            otrasEspecialidadesKeyboard(estado.servicio!)
+            `⚠️ ${disponibilidad.mensaje || 'Ese horario no está disponible.'}\n\nElegí otro turno:`,
+            viewActualizada.keyboard
           );
         }
       } else if (data === 'noop') {
@@ -772,15 +808,19 @@ export async function POST(request: NextRequest) {
                   ]
                 );
               } else {
+                // El slot fue tomado justo antes: mostrar horarios disponibles actualizados
+                const viewActualizada = await buildHorariosView(estado.fecha!, estado.servicio!);
                 await sendWithKeyboard(
-                  `Ese horario para ${estado.servicio} acaba de ser reservado.`,
-                  otrasEspecialidadesKeyboard(estado.servicio!)
+                  `⚠️ Ese horario acaba de ser reservado. Estos son los turnos disponibles para ${estado.servicio}:`,
+                  viewActualizada.keyboard
                 );
               }
             } else {
+              // Slot ya ocupado: mostrar horarios disponibles actualizados
+              const viewActualizada = await buildHorariosView(estado.fecha!, estado.servicio!);
               await sendWithKeyboard(
-                disponibilidad.mensaje || 'Lo siento, ese horario no está disponible.',
-                otrasEspecialidadesKeyboard(estado.servicio!)
+                `⚠️ ${disponibilidad.mensaje || 'Ese horario no está disponible.'}\n\nElegí otro turno:`,
+                viewActualizada.keyboard
               );
             }
           } else {
