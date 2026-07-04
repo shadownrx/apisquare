@@ -10,6 +10,15 @@ interface ConversationState {
   fecha?: string;
 }
 
+interface Reservation {
+  id: string;
+  servicio: string;
+  nombre: string;
+  fecha: string;
+  hora: string;
+  chatId: number;
+}
+
 // Inicializar cliente de Vercel KV con manejo de errores
 let kv: any = null;
 try {
@@ -39,6 +48,23 @@ const horariosDisponibles = [
   '13:00', '14:00', '15:00', '16:00', '17:00'
 ];
 const diasLaborables = [1, 2, 3, 4, 5]; // Lunes (1) a Viernes (5)
+
+// Función para formatear fecha de forma legible
+function formatDate(fechaStr: string): string {
+  const fecha = new Date(fechaStr + 'T12:00:00');
+  const options: Intl.DateTimeFormatOptions = {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  };
+  return fecha.toLocaleDateString('es-ES', options);
+}
+
+// Función para generar ID único
+function generateId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
 
 // Función para verificar disponibilidad (solo con KV)
 async function verificarDisponibilidad(fechaStr: string, horaStr: string) {
@@ -79,27 +105,64 @@ async function verificarDisponibilidad(fechaStr: string, horaStr: string) {
 }
 
 // Función para guardar reserva
-async function guardarReserva(chatId: number, datos: any) {
+async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): Promise<Reservation | null> {
   try {
+    const id = generateId();
+    const reserva: Reservation = { ...datos, id };
     const key = `reserva:${datos.fecha}:${datos.hora}`;
+    const idKey = `reserva:id:${id}`;
     
     if (kv) {
-      await kv.set(key, JSON.stringify(datos), { ex: 86400 * 30 }); // Expirar en 30 días
+      await kv.set(key, JSON.stringify(reserva), { ex: 86400 * 30 }); // Expirar en 30 días
+      await kv.set(idKey, JSON.stringify(reserva), { ex: 86400 * 30 });
       
       // Guardar también por usuario
       const userKey = `user:${chatId}:reservas`;
       const userReservas = await kv.get(userKey) || [];
       const reservasArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
-      reservasArray.push(datos);
+      reservasArray.push(reserva);
       await kv.set(userKey, JSON.stringify(reservasArray));
     } else {
       // Almacenar en memoria para desarrollo local
-      addLocalReservation(datos);
+      addLocalReservation(reserva);
+    }
+    
+    return reserva;
+  } catch (error) {
+    console.error('Error al guardar reserva:', error);
+    return null;
+  }
+}
+
+// Función para eliminar reserva
+async function eliminarReserva(chatId: number, reservaId: string) {
+  try {
+    if (kv) {
+      // Obtener la reserva primero para conocer fecha y hora
+      const idKey = `reserva:id:${reservaId}`;
+      const reservaData = await kv.get(idKey);
+      if (!reservaData) return false;
+      
+      const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
+      
+      // Eliminar todas las referencias
+      const key = `reserva:${reserva.fecha}:${reserva.hora}`;
+      await kv.del(key);
+      await kv.del(idKey);
+      
+      // Eliminar de la lista del usuario
+      const userKey = `user:${chatId}:reservas`;
+      const userReservas = await kv.get(userKey) || [];
+      let reservasArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+      reservasArray = reservasArray.filter((r: Reservation) => r.id !== reservaId);
+      await kv.set(userKey, JSON.stringify(reservasArray));
+    } else {
+      // TODO: Implementar delete en memoria local
     }
     
     return true;
   } catch (error) {
-    console.error('Error al guardar reserva:', error);
+    console.error('Error al eliminar reserva:', error);
     return false;
   }
 }
@@ -183,7 +246,7 @@ export async function POST(request: NextRequest) {
           servicios.map(s => [{ text: s, callback_data: `servicio:${s}` }])
         );
       } else if (data === 'misreservas') {
-        let reservasArray: any[] = [];
+        let reservasArray: Reservation[] = [];
         
         if (kv) {
           const userReservasKey = `user:${chatId}:reservas`;
@@ -203,11 +266,32 @@ export async function POST(request: NextRequest) {
             ]
           );
         } else {
-          let mensaje = 'Tus reservas:\n';
-          reservasArray.forEach((r: any, i: number) => {
-            mensaje += `${i + 1}. ${r.servicio} - ${r.fecha} ${r.hora}\n`;
-          });
-          await sendWithKeyboard(mensaje, [[{ text: '🏠 Menú', callback_data: 'menu' }]]);
+          // Mostrar reservas con botones de eliminar
+          const keyboard = reservasArray.map((r: Reservation) => [
+            { text: `${r.servicio} - ${formatDate(r.fecha)} ${r.hora}`, callback_data: 'noop' },
+            { text: '❌ Eliminar', callback_data: `eliminar:${r.id}` }
+          ]);
+          keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
+          
+          await sendWithKeyboard('Tus reservas:', keyboard);
+        }
+      } else if (data.startsWith('eliminar:')) {
+        const reservaId = data.replace('eliminar:', '');
+        const eliminado = await eliminarReserva(chatId, reservaId);
+        
+        if (eliminado) {
+          await sendWithKeyboard(
+            'Reserva eliminada correctamente!',
+            [
+              [{ text: '📋 Mis reservas', callback_data: 'misreservas' }],
+              [{ text: '🏠 Menú', callback_data: 'menu' }]
+            ]
+          );
+        } else {
+          await sendWithKeyboard(
+            'Ups, no se pudo eliminar la reserva.',
+            [[{ text: '🏠 Menú', callback_data: 'menu' }]]
+          );
         }
       } else if (data === 'menu') {
         await saveState({ paso: null });
@@ -227,24 +311,36 @@ export async function POST(request: NextRequest) {
         if (disponibilidad.disponible) {
           // Guardar reserva
           const datosReserva = {
-            servicio: estado.servicio,
-            nombre: estado.nombre,
-            fecha: estado.fecha,
+            servicio: estado.servicio!,
+            nombre: estado.nombre!,
+            fecha: estado.fecha!,
             hora: horaSeleccionada,
             chatId: chatId
           };
           
-          const guardado = await guardarReserva(chatId, datosReserva);
+          const reserva = await guardarReserva(chatId, datosReserva);
           
-          if (guardado) {
+          if (reserva) {
             await saveState({ paso: null });
-            await sendWithKeyboard(`Listo! Tu reserva está confirmada:\n\n${datosReserva.servicio}\n${datosReserva.fecha} ${datosReserva.hora}\n\n¡Nos vemos! 😊`, [[{ text: '🏠 Menú', callback_data: 'menu' }]]);
+            await sendWithKeyboard(
+              `Listo! Tu reserva está confirmada:\n\n` +
+              `✨ ${reserva.servicio}\n` +
+              `📅 ${formatDate(reserva.fecha)}\n` +
+              `🕐 ${reserva.hora}\n\n` +
+              `¡Nos vemos! 😊`,
+              [
+                [{ text: '📋 Mis reservas', callback_data: 'misreservas' }],
+                [{ text: '🏠 Menú', callback_data: 'menu' }]
+              ]
+            );
           } else {
             await sendWithKeyboard('Ups, hubo un error. ¿Quieres intentar de nuevo?', [[{ text: '🔄 Sí', callback_data: 'reservar' }]]);
           }
         } else {
           await sendWithKeyboard(`Lo siento, ese horario no está disponible. ¿Quieres elegir otro?`, [[{ text: '🔄 Sí, otro horario', callback_data: 'reservar' }]]);
         }
+      } else if (data === 'noop') {
+        // No hacer nada
       }
       
       return NextResponse.json({ status: 'ok' });
@@ -346,7 +442,7 @@ export async function POST(request: NextRequest) {
       }
 
       else if (['/misreservas', 'mis reservas', 'misreservas', 'reservas', 'ver reservas', 'ver mis reservas'].includes(normalizedText)) {
-        let reservasArray: any[] = [];
+        let reservasArray: Reservation[] = [];
         
         if (kv) {
           const userReservasKey = `user:${chatId}:reservas`;
@@ -366,11 +462,14 @@ export async function POST(request: NextRequest) {
             ]
           );
         } else {
-          let mensaje = 'Tus reservas:\n';
-          reservasArray.forEach((r: any, i: number) => {
-            mensaje += `${i + 1}. ${r.servicio} - ${r.fecha} ${r.hora}\n`;
-          });
-          await sendWithKeyboard(mensaje, [[{ text: '🏠 Menú', callback_data: 'menu' }]]);
+          // Mostrar reservas con botones de eliminar
+          const keyboard = reservasArray.map((r: Reservation) => [
+            { text: `${r.servicio} - ${formatDate(r.fecha)} ${r.hora}`, callback_data: 'noop' },
+            { text: '❌ Eliminar', callback_data: `eliminar:${r.id}` }
+          ]);
+          keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
+          
+          await sendWithKeyboard('Tus reservas:', keyboard);
         }
       }
 
@@ -457,18 +556,28 @@ export async function POST(request: NextRequest) {
             
             if (disponibilidad.disponible) {
               const datosReserva = {
-                servicio: estado.servicio,
-                nombre: estado.nombre,
-                fecha: estado.fecha,
+                servicio: estado.servicio!,
+                nombre: estado.nombre!,
+                fecha: estado.fecha!,
                 hora: horaSeleccionada,
                 chatId: chatId
               };
               
-              const guardado = await guardarReserva(chatId, datosReserva);
+              const reserva = await guardarReserva(chatId, datosReserva);
               
-              if (guardado) {
+              if (reserva) {
                 await saveState({ paso: null });
-                await sendWithKeyboard(`Listo! Tu reserva está confirmada:\n\n${datosReserva.servicio}\n${datosReserva.fecha} ${datosReserva.hora}\n\n¡Nos vemos! 😊`, [[{ text: '🏠 Menú', callback_data: 'menu' }]]);
+                await sendWithKeyboard(
+                  `Listo! Tu reserva está confirmada:\n\n` +
+                  `✨ ${reserva.servicio}\n` +
+                  `📅 ${formatDate(reserva.fecha)}\n` +
+                  `🕐 ${reserva.hora}\n\n` +
+                  `¡Nos vemos! 😊`,
+                  [
+                    [{ text: '📋 Mis reservas', callback_data: 'misreservas' }],
+                    [{ text: '🏠 Menú', callback_data: 'menu' }]
+                  ]
+                );
               } else {
                 await sendWithKeyboard('Ups, hubo un error. ¿Quieres intentar de nuevo?', [[{ text: '🔄 Sí', callback_data: 'reservar' }]]);
               }
