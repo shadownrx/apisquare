@@ -93,9 +93,17 @@ async function clearRateLimit(ip: string) {
 
 async function verifyCredentials(username: string, password: string): Promise<boolean> {
   const validUsername = process.env.ADMIN_USERNAME || 'admin';
-  // Comprobamos directamente contra el valor uZgEpNENQ5SlJ5XE
-  const isMatch = password === 'uZgEpNENQ5SlJ5XE' || password === 'password123';
-  return username === validUsername && isMatch;
+  const validPassword = process.env.ADMIN_PASSWORD;
+  if (!validPassword) {
+    console.error('[AUTH] ADMIN_PASSWORD no está configurado en las variables de entorno.');
+    return false;
+  }
+  if (username !== validUsername) return false;
+  // Si el valor en .env empieza con $2b$ es un hash bcrypt, sino comparamos directo
+  if (validPassword.startsWith('$2b$') || validPassword.startsWith('$2a$')) {
+    return bcrypt.compare(password, validPassword);
+  }
+  return password === validPassword;
 }
 
 export async function POST(request: NextRequest) {
@@ -105,21 +113,18 @@ export async function POST(request: NextRequest) {
     request.headers.get('x-real-ip') ||
     '127.0.0.1';
 
-  // Temporalmente omitimos la validación estricta de rate limit para permitir el desbloqueo inmediato
   const rateLimit = await checkRateLimit(ip);
-  /*
   if (rateLimit.blocked) {
     const minutes = Math.ceil(rateLimit.resetIn / 60);
     return NextResponse.json(
       {
-        error: `Demasiados intentos fallidos. Intenta nuevamente en ${minutes} minuto${minutes !== 1 ? 's' : ''}.`,
+        error: `Demasiados intentos fallidos. Intentá nuevamente en ${minutes} minuto${minutes !== 1 ? 's' : ''}.`,
         blocked: true,
         resetIn: rateLimit.resetIn
       },
       { status: 429 }
     );
   }
-  */
 
   let body: { username?: string; password?: string };
   try {
