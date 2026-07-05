@@ -11,15 +11,18 @@ interface Reservation {
   chatId: number;
 }
 
-// Almacenamiento en memoria para desarrollo local
-const localReservations: Reservation[] = [];
+// Almacenamiento en memoria global para desarrollo local
+const globalReservations = (global as any)._localReservations || [];
+if (!(global as any)._localReservations) {
+  (global as any)._localReservations = globalReservations;
+}
 
-export function getLocalReservations() {
-  return localReservations;
+export function getLocalReservations(): Reservation[] {
+  return (global as any)._localReservations;
 }
 
 export function addLocalReservation(reservation: Reservation) {
-  localReservations.push(reservation);
+  (global as any)._localReservations.push(reservation);
 }
 
 function getKV() {
@@ -42,7 +45,7 @@ export async function GET(request: NextRequest) {
   try {
     const kv = getKV();
     if (!kv) {
-      return NextResponse.json({ reservations: localReservations });
+      return NextResponse.json({ reservations: getLocalReservations() });
     }
 
     const keys = await kv.keys('reserva:id:*');
@@ -86,9 +89,10 @@ export async function DELETE(request: NextRequest) {
 
     const kv = getKV();
     if (!kv) {
-      const index = localReservations.findIndex(r => r.id === id);
+      const localRes = getLocalReservations();
+      const index = localRes.findIndex(r => r.id === id);
       if (index !== -1) {
-        localReservations.splice(index, 1);
+        localRes.splice(index, 1);
       }
       return NextResponse.json({ success: true });
     }
