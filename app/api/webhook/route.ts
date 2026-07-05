@@ -420,6 +420,22 @@ async function eliminarReserva(chatId: number, reservaId: string) {
 // Set en memoria para deduplicar updates en entorno local
 const processedUpdates = new Set<number>();
 
+const MAX_RESERVACIONES_POR_USUARIO = 2;
+
+async function checkReservationLimit(chatId: number): Promise<boolean> {
+  let count = 0;
+  if (kv) {
+    const userReservasKey = `user:${chatId}:reservas`;
+    const userReservas = await kv.get(userReservasKey) || [];
+    const arr = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+    count = arr.length;
+  } else {
+    const localReservations = getLocalReservations();
+    count = localReservations.filter(r => r.chatId === chatId).length;
+  }
+  return count >= MAX_RESERVACIONES_POR_USUARIO;
+}
+
 export async function POST(request: NextRequest) {
   console.log('=== NUEVA SOLICITUD ===');
 
@@ -567,11 +583,19 @@ export async function POST(request: NextRequest) {
         );
 
       } else if (data === 'reservar') {
-        await saveState({ paso: 'servicio' });
-        await sendWithKeyboard(
-          '¿Qué servicio querés reservar?',
-          servicios.map(s => [{ text: s, callback_data: `servicio:${s}` }])
-        );
+        const limitReached = await checkReservationLimit(chatId);
+        if (limitReached) {
+          await sendWithKeyboard(
+            '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos permitidos. Para reservar uno nuevo, primero tenés que cancelar alguno desde tus reservas.',
+            [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+          );
+        } else {
+          await saveState({ paso: 'servicio' });
+          await sendWithKeyboard(
+            '¿Qué servicio querés reservar?',
+            servicios.map(s => [{ text: s, callback_data: `servicio:${s}` }])
+          );
+        }
 
       } else if (data === 'misreservas') {
         let reservasArray: Reservation[] = [];
@@ -819,11 +843,19 @@ export async function POST(request: NextRequest) {
         }
 
       } else if (['/reservar', 'reservar', 'reservar turno', 'quiero reservar', 'agendar', 'quiero agendar', 'hacer una reserva'].includes(normalizedText)) {
-        await saveState({ paso: 'servicio' });
-        await sendWithKeyboard(
-          '¿Qué servicio querés reservar?',
-          servicios.map(s => [{ text: s, callback_data: `servicio:${s}` }])
-        );
+        const limitReached = await checkReservationLimit(chatId);
+        if (limitReached) {
+          await sendWithKeyboard(
+            '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos permitidos. Para reservar uno nuevo, primero tenés que cancelar alguno desde tus reservas.',
+            [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+          );
+        } else {
+          await saveState({ paso: 'servicio' });
+          await sendWithKeyboard(
+            '¿Qué servicio querés reservar?',
+            servicios.map(s => [{ text: s, callback_data: `servicio:${s}` }])
+          );
+        }
 
       } else if (estado && estado.paso) {
         console.log('Estado de conversación:', estado);
