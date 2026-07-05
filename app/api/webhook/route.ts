@@ -603,7 +603,24 @@ export async function POST(request: NextRequest) {
         if (kv) {
           const userReservasKey = `user:${chatId}:reservas`;
           const userReservas = await kv.get(userReservasKey) || [];
-          reservasArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+          let rawArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+          
+          // Self-healing: verificar que las reservas realmente existan
+          const validReservations = [];
+          let changed = false;
+          for (const r of rawArray) {
+            const exists = await kv.get(`reserva:id:${r.id}`);
+            if (exists) {
+              validReservations.push(r);
+            } else {
+              changed = true; // Se encontró una reserva huérfana
+            }
+          }
+          
+          if (changed) {
+            await kv.set(userReservasKey, JSON.stringify(validReservations));
+          }
+          reservasArray = validReservations;
         } else {
           const localReservations = getLocalReservations();
           reservasArray = localReservations.filter(r => r.chatId === chatId);
@@ -819,7 +836,24 @@ export async function POST(request: NextRequest) {
         if (kv) {
           const userReservasKey = `user:${chatId}:reservas`;
           const userReservas = await kv.get(userReservasKey) || [];
-          reservasArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+          let rawArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+          
+          // Self-healing: verificar que las reservas realmente existan
+          const validReservations = [];
+          let changed = false;
+          for (const r of rawArray) {
+            const exists = await kv.get(`reserva:id:${r.id}`);
+            if (exists) {
+              validReservations.push(r);
+            } else {
+              changed = true;
+            }
+          }
+          
+          if (changed) {
+            await kv.set(userReservasKey, JSON.stringify(validReservations));
+          }
+          reservasArray = validReservations;
         } else {
           const localReservations = getLocalReservations();
           reservasArray = localReservations.filter(r => r.chatId === chatId);
