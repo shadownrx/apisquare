@@ -82,8 +82,8 @@ export default function AdminPage() {
   const [config, setConfig] = useState<Config | null>(null);
   const [loadingConfig, setLoadingConfig] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
-  const [editingProf, setEditingProf] = useState<string | null>(null);
-  const [newFeriado, setNewFeriado] = useState('');
+  const [collapsedProfessionals, setCollapsedProfessionals] = useState<Set<string>>(new Set());
+  const [collapsedDays, setCollapsedDays] = useState<{ [prof: string]: Set<number> }>({});
 
   useEffect(() => {
     setMounted(true);
@@ -192,13 +192,15 @@ export default function AdminPage() {
   }
 
   function addFeriado() {
-    if (!config || !newFeriado) return;
-    if (!config.feriados.includes(newFeriado)) {
+    const inputElement = document.getElementById('feriadoInput') as HTMLInputElement | null;
+    if (!config || !inputElement?.value) return;
+    const fecha = inputElement.value;
+    if (!config.feriados.includes(fecha)) {
       setConfig({
         ...config,
-        feriados: [...config.feriados, newFeriado].sort(),
+        feriados: [...config.feriados, fecha].sort(),
       });
-      setNewFeriado('');
+      inputElement.value = '';
     }
   }
 
@@ -208,6 +210,29 @@ export default function AdminPage() {
       ...config,
       feriados: config.feriados.filter(f => f !== feriado),
     });
+  }
+
+  function toggleProfessionalCollapse(name: string) {
+    const newCollapsed = new Set(collapsedProfessionals);
+    if (newCollapsed.has(name)) {
+      newCollapsed.delete(name);
+    } else {
+      newCollapsed.add(name);
+    }
+    setCollapsedProfessionals(newCollapsed);
+  }
+
+  function toggleDayCollapse(prof: string, day: number) {
+    const newCollapsed = { ...collapsedDays };
+    if (!newCollapsed[prof]) {
+      newCollapsed[prof] = new Set();
+    }
+    if (newCollapsed[prof].has(day)) {
+      newCollapsed[prof].delete(day);
+    } else {
+      newCollapsed[prof].add(day);
+    }
+    setCollapsedDays(newCollapsed);
   }
 
   function updateProfSchedule(prof: string, day: number, slots: TimeSlot[]) {
@@ -337,18 +362,18 @@ export default function AdminPage() {
         }
 
         .btn {
-          display: flex; align-items: center; gap: 7px;
+          display: flex; align-items: center; justify-content: center; gap: 7px;
           padding: 8px 16px;
           font-size: 13px;
-          font-weight: 500;
+          font-weight: 600;
           font-family: 'Inter', sans-serif;
-          border-radius: 8px;
+          border-radius: 10px;
           cursor: pointer;
-          transition: all 0.2s;
+          transition: all 0.2s ease;
           border: 1px solid transparent;
         }
 
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
 
         .btn-refresh {
           background: rgba(99,102,241,0.15);
@@ -360,6 +385,7 @@ export default function AdminPage() {
           background: rgba(99,102,241,0.25);
           border-color: rgba(99,102,241,0.5);
           color: #c7d2fe;
+          transform: translateY(-1px);
         }
 
         .btn-logout {
@@ -368,9 +394,10 @@ export default function AdminPage() {
           border-color: rgba(239,68,68,0.25);
         }
 
-        .btn-logout:hover {
+        .btn-logout:hover:not(:disabled) {
           background: rgba(239,68,68,0.2);
           border-color: rgba(239,68,68,0.4);
+          transform: translateY(-1px);
         }
 
         .refresh-icon {
@@ -395,27 +422,29 @@ export default function AdminPage() {
         }
 
         .tab {
-          padding: 12px 20px;
+          padding: 14px 24px;
           font-size: 14px;
           font-weight: 600;
           color: rgba(148,163,184,0.7);
           cursor: pointer;
           border-bottom: 2px solid transparent;
-          transition: all 0.2s;
+          transition: all 0.2s ease;
         }
 
         .tab:hover {
-          color: #e2e8f0;
+          color: #cbd5e1;
+          background: rgba(255,255,255,0.03);
         }
 
         .tab.active {
           color: #818cf8;
           border-bottom-color: #818cf8;
+          background: rgba(129,140,248,0.05);
         }
 
         /* Main content */
         .admin-main {
-          max-width: 1280px;
+          max-width: 1200px;
           margin: 0 auto;
           padding: 32px;
         }
@@ -424,7 +453,7 @@ export default function AdminPage() {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          margin-bottom: 24px;
+          margin-bottom: 28px;
         }
 
         .section-title {
@@ -617,19 +646,20 @@ export default function AdminPage() {
           font-size: 12px;
           font-weight: 600;
           font-family: 'Inter', sans-serif;
-          background: rgba(239,68,68,0.08);
+          background: rgba(239,68,68,0.1);
           color: #fca5a5;
-          border: 1px solid rgba(239,68,68,0.2);
-          border-radius: 8px;
+          border: 1px solid rgba(239,68,68,0.25);
+          border-radius: 10px;
           cursor: pointer;
-          transition: all 0.2s;
+          transition: all 0.2s ease;
           letter-spacing: 0.2px;
         }
 
-        .btn-delete:hover {
-          background: rgba(239,68,68,0.18);
+        .btn-delete:hover:not(:disabled) {
+          background: rgba(239,68,68,0.2);
           border-color: rgba(239,68,68,0.4);
           color: #fecaca;
+          transform: translateY(-1px);
         }
 
         /* Empty State */
@@ -808,11 +838,6 @@ export default function AdminPage() {
           transform: translateY(-1px);
         }
 
-        .modal-btn-confirm:disabled {
-          opacity: 0.6;
-          cursor: not-allowed;
-        }
-
         .btn-spinner {
           width: 14px; height: 14px;
           border: 2px solid rgba(255,255,255,0.3);
@@ -864,40 +889,56 @@ export default function AdminPage() {
         .config-card {
           background: rgba(255,255,255,0.04);
           border: 1px solid rgba(255,255,255,0.08);
-          border-radius: 16px;
-          padding: 24px;
+          border-radius: 18px;
+          padding: 28px;
+          margin-bottom: 24px;
+          transition: all 0.2s ease;
+        }
+
+        .config-card:hover {
+          border-color: rgba(99,102,241,0.2);
+          box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+        }
+
+        .config-card-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
           margin-bottom: 20px;
         }
 
         .config-title {
-          font-size: 18px;
+          font-size: 20px;
           font-weight: 700;
           color: #f8fafc;
-          margin-bottom: 16px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
         }
 
         .config-subtitle {
-          font-size: 13px;
+          font-size: 14px;
           color: rgba(148,163,184,0.7);
-          margin-bottom: 16px;
+          margin-bottom: 20px;
         }
 
         .input {
           width: 100%;
-          padding: 10px 14px;
+          padding: 12px 16px;
           font-size: 14px;
           font-family: 'Inter', sans-serif;
           background: rgba(255,255,255,0.05);
           border: 1px solid rgba(255,255,255,0.1);
-          border-radius: 8px;
+          border-radius: 10px;
           color: #e2e8f0;
           outline: none;
-          transition: all 0.2s;
+          transition: all 0.2s ease;
         }
 
         .input:focus {
           border-color: #818cf8;
           box-shadow: 0 0 0 3px rgba(129,140,248,0.15);
+          background: rgba(255,255,255,0.07);
         }
 
         .input::placeholder {
@@ -915,6 +956,7 @@ export default function AdminPage() {
         .btn-primary:hover:not(:disabled) {
           opacity: 0.9;
           transform: translateY(-1px);
+          box-shadow: 0 6px 16px rgba(99,102,241,0.4);
         }
 
         .btn-secondary {
@@ -926,6 +968,7 @@ export default function AdminPage() {
         .btn-secondary:hover:not(:disabled) {
           background: rgba(99,102,241,0.2);
           color: #c7d2fe;
+          transform: translateY(-1px);
         }
 
         .btn-danger {
@@ -937,30 +980,44 @@ export default function AdminPage() {
         .btn-danger:hover:not(:disabled) {
           background: rgba(239,68,68,0.2);
           color: #fecaca;
+          transform: translateY(-1px);
         }
 
         .btn-small {
-          padding: 6px 12px;
-          font-size: 12px;
+          padding: 8px 14px;
+          font-size: 13px;
+          font-weight: 600;
+        }
+
+        .btn-icon {
+          padding: 8px;
+          width: 36px;
+          height: 36px;
+        }
+
+        .add-feriado-row {
+          display: flex;
+          gap: 12px;
         }
 
         .feriados-list {
           display: flex;
           flex-wrap: wrap;
-          gap: 10px;
-          margin-top: 16px;
+          gap: 12px;
+          margin-top: 20px;
         }
 
         .feriado-badge {
           display: flex;
           align-items: center;
-          gap: 8px;
-          padding: 8px 14px;
+          gap: 10px;
+          padding: 10px 16px;
           background: rgba(245,158,11,0.1);
           border: 1px solid rgba(245,158,11,0.3);
-          border-radius: 8px;
+          border-radius: 10px;
           color: #fbbf24;
           font-size: 13px;
+          font-weight: 500;
         }
 
         .feriado-badge button {
@@ -968,80 +1025,160 @@ export default function AdminPage() {
           border: none;
           color: #fca5a5;
           cursor: pointer;
-          font-size: 16px;
+          font-size: 18px;
           padding: 0;
+          transition: transform 0.1s ease;
+        }
+
+        .feriado-badge button:hover {
+          transform: scale(1.2);
         }
 
         .prof-card {
           background: rgba(255,255,255,0.03);
           border: 1px solid rgba(255,255,255,0.06);
-          border-radius: 12px;
+          border-radius: 14px;
           padding: 20px;
           margin-bottom: 16px;
+          transition: all 0.2s ease;
+        }
+
+        .prof-card:hover {
+          border-color: rgba(129,140,248,0.2);
         }
 
         .prof-header {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          margin-bottom: 16px;
+          cursor: pointer;
         }
 
         .prof-name {
-          font-size: 16px;
+          font-size: 17px;
           font-weight: 700;
           color: #f1f5f9;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .prof-avatar {
+          width: 36px;
+          height: 36px;
+          background: linear-gradient(135deg, #6366f1, #8b5cf6);
+          border-radius: 10px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 16px;
+          font-weight: 700;
+        }
+
+        .collapse-icon {
+          font-size: 18px;
+          transition: transform 0.3s ease;
+        }
+
+        .collapse-icon.open {
+          transform: rotate(180deg);
+        }
+
+        .prof-content {
+          margin-top: 20px;
+          animation: slideDown 0.2s ease;
+        }
+
+        @keyframes slideDown {
+          from { opacity: 0; transform: translateY(-10px); }
+          to { opacity: 1; transform: translateY(0); }
         }
 
         .day-section {
-          margin-bottom: 16px;
+          margin-bottom: 18px;
+          padding-bottom: 18px;
+          border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .day-section:last-child {
+          border-bottom: none;
+          margin-bottom: 0;
+          padding-bottom: 0;
         }
 
         .day-header {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          margin-bottom: 8px;
-          font-size: 14px;
+          margin-bottom: 12px;
+          font-size: 15px;
           font-weight: 600;
           color: #94a3b8;
+          cursor: pointer;
+        }
+
+        .day-header:hover {
+          color: #cbd5e1;
         }
 
         .slots-list {
           display: flex;
           flex-direction: column;
-          gap: 8px;
+          gap: 12px;
         }
 
         .slot-row {
           display: flex;
-          gap: 8px;
+          gap: 12px;
           align-items: center;
+        }
+
+        .slot-label {
+          width: 60px;
+          font-size: 13px;
+          color: rgba(148,163,184,0.7);
         }
 
         .slot-input {
           flex: 1;
-          padding: 8px 12px;
-          font-size: 13px;
+          padding: 10px 14px;
+          font-size: 14px;
         }
 
         .service-row {
           display: grid;
           grid-template-columns: 2fr 1fr 1fr auto;
-          gap: 12px;
+          gap: 14px;
           align-items: center;
-          margin-bottom: 12px;
+          padding: 12px 0;
+          border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .service-row:last-child {
+          border-bottom: none;
         }
 
         .service-row .input {
-          padding: 8px 12px;
+          padding: 10px 14px;
           font-size: 13px;
         }
 
         .action-row {
           display: flex;
-          gap: 10px;
-          margin-top: 20px;
+          gap: 12px;
+          margin-top: 24px;
+          padding-top: 24px;
+          border-top: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .action-row.fixed-bottom {
+          position: sticky;
+          bottom: 24px;
+          left: 0;
+          right: 0;
+          z-index: 50;
+          background: linear-gradient(to top, #0f172a 60%, transparent);
+          padding: 24px 0 0 0;
         }
       `}</style>
 
@@ -1233,19 +1370,20 @@ export default function AdminPage() {
                 <>
                   {/* Feriados */}
                   <div className="config-card">
-                    <div className="config-title">🎉 Feriados</div>
-                    <div className="config-subtitle">
-                      Agrega días feriados en los que no habrá atenciones
+                    <div className="config-card-header">
+                      <h2 className="config-title">🎉 Feriados</h2>
                     </div>
-                    <div style={{ display: 'flex', gap: 10 }}>
+                    <p className="config-subtitle">
+                      Agrega días feriados en los que no habrá atenciones
+                    </p>
+                    <div className="add-feriado-row">
                       <input
+                        id="feriadoInput"
                         type="date"
                         className="input"
-                        value={newFeriado}
-                        onChange={(e) => setNewFeriado(e.target.value)}
                       />
-                      <button className="btn btn-primary" onClick={addFeriado}>
-                        ➕ Agregar
+                      <button className="btn btn-secondary btn-small" onClick={addFeriado}>
+                        ➕ Agregar feriado
                       </button>
                     </div>
                     <div className="feriados-list">
@@ -1266,10 +1404,15 @@ export default function AdminPage() {
 
                   {/* Servicios */}
                   <div className="config-card">
-                    <div className="config-title">🩺 Servicios</div>
-                    <div className="config-subtitle">
-                      Configura los servicios disponibles, su duración y precio
+                    <div className="config-card-header">
+                      <h2 className="config-title">🩺 Servicios</h2>
+                      <button className="btn btn-secondary btn-small" onClick={addService}>
+                        ➕ Agregar servicio
+                      </button>
                     </div>
+                    <p className="config-subtitle">
+                      Configura los servicios disponibles, su duración y precio
+                    </p>
                     {config.servicios.map((servicio, index) => (
                       <div key={index} className="service-row">
                         <input
@@ -1294,93 +1437,115 @@ export default function AdminPage() {
                           onChange={(e) => updateService(index, 'precio', parseInt(e.target.value) || 0)}
                         />
                         <button
-                          className="btn btn-danger btn-small"
+                          className="btn btn-danger btn-icon"
                           onClick={() => removeService(index)}
                         >
                           🗑️
                         </button>
                       </div>
                     ))}
-                    <div className="action-row">
-                      <button className="btn btn-secondary" onClick={addService}>
-                        ➕ Agregar servicio
-                      </button>
-                    </div>
                   </div>
 
                   {/* Profesionales */}
                   <div className="config-card">
-                    <div className="config-title">👨‍⚕️ Horarios de profesionales</div>
-                    <div className="config-subtitle">
-                      Configura los horarios de atención de cada profesional
+                    <div className="config-card-header">
+                      <h2 className="config-title">👨‍⚕️ Horarios de profesionales</h2>
                     </div>
+                    <p className="config-subtitle">
+                      Configura los horarios de atención de cada profesional
+                    </p>
                     {Object.entries(config.profesionales).map(([prof, schedule]) => (
                       <div key={prof} className="prof-card">
-                        <div className="prof-header">
-                          <div className="prof-name">{prof}</div>
-                        </div>
-                        {DAYS.map(day => (
-                          <div key={day.id} className="day-section">
-                            <div className="day-header">
-                              <span>{day.name}</span>
-                              <button
-                                className="btn btn-secondary btn-small"
-                                onClick={() => addSlot(prof, day.id)}
-                              >
-                                ➕ Agregar horario
-                              </button>
-                            </div>
-                            <div className="slots-list">
-                              {(schedule[day.id] || []).map((slot, slotIndex) => (
-                                <div key={slotIndex} className="slot-row">
-                                  <input
-                                    type="time"
-                                    className="input slot-input"
-                                    value={slot.inicio}
-                                    onChange={(e) => updateSlot(prof, day.id, slotIndex, 'inicio', e.target.value)}
-                                  />
-                                  <span style={{ color: '#94a3b8' }}>a</span>
-                                  <input
-                                    type="time"
-                                    className="input slot-input"
-                                    value={slot.fin}
-                                    onChange={(e) => updateSlot(prof, day.id, slotIndex, 'fin', e.target.value)}
-                                  />
-                                  <button
-                                    className="btn btn-danger btn-small"
-                                    onClick={() => removeSlot(prof, day.id, slotIndex)}
-                                  >
-                                    🗑️
-                                  </button>
-                                </div>
-                              ))}
-                              {(!schedule[day.id] || schedule[day.id].length === 0) && (
-                                <span style={{ color: 'rgba(148,163,184,0.5)', fontSize: 13 }}>
-                                  No hay horarios configurados para este día
-                                </span>
-                              )}
-                            </div>
+                        <div
+                          className="prof-header"
+                          onClick={() => toggleProfessionalCollapse(prof)}
+                        >
+                          <div className="prof-name">
+                            <div className="prof-avatar">{prof.charAt(0)}</div>
+                            {prof}
                           </div>
-                        ))}
+                          <span className={`collapse-icon ${collapsedProfessionals.has(prof) ? '' : 'open'}`}>
+                            ▼
+                          </span>
+                        </div>
+                        {!collapsedProfessionals.has(prof) && (
+                          <div className="prof-content">
+                            {DAYS.map(day => (
+                              <div key={day.id} className="day-section">
+                                <div
+                                  className="day-header"
+                                  onClick={() => toggleDayCollapse(prof, day.id)}
+                                >
+                                  <span>{day.name}</span>
+                                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                    <span className={`collapse-icon ${collapsedDays[prof]?.has(day.id) ? '' : 'open'}`} style={{ fontSize: '14px' }}>
+                                      ▼
+                                    </span>
+                                    <button
+                                      className="btn btn-secondary btn-small"
+                                      onClick={(e) => { e.stopPropagation(); addSlot(prof, day.id); }}
+                                    >
+                                      ➕ Agregar horario
+                                    </button>
+                                  </div>
+                                </div>
+                                {!collapsedDays[prof]?.has(day.id) && (
+                                  <div className="slots-list">
+                                    {(schedule[day.id] || []).map((slot, slotIndex) => (
+                                      <div key={slotIndex} className="slot-row">
+                                        <span className="slot-label">Horario {slotIndex + 1}</span>
+                                        <input
+                                          type="time"
+                                          className="input slot-input"
+                                          value={slot.inicio}
+                                          onChange={(e) => updateSlot(prof, day.id, slotIndex, 'inicio', e.target.value)}
+                                        />
+                                        <span style={{ color: '#94a3b8', fontSize: '14px' }}>a</span>
+                                        <input
+                                          type="time"
+                                          className="input slot-input"
+                                          value={slot.fin}
+                                          onChange={(e) => updateSlot(prof, day.id, slotIndex, 'fin', e.target.value)}
+                                        />
+                                        <button
+                                          className="btn btn-danger btn-icon"
+                                          onClick={() => removeSlot(prof, day.id, slotIndex)}
+                                        >
+                                          🗑️
+                                        </button>
+                                      </div>
+                                    ))}
+                                    {(!schedule[day.id] || schedule[day.id].length === 0) && (
+                                      <span style={{ color: 'rgba(148,163,184,0.5)', fontSize: 13, padding: '8px 0' }}>
+                                        No hay horarios configurados para este día
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
-                  </div>
 
-                  <div className="action-row">
-                    <button
-                      className="btn btn-primary"
-                      onClick={handleSaveConfig}
-                      disabled={savingConfig}
-                    >
-                      {savingConfig ? (
-                        <>
-                          <div className="btn-spinner" />
-                          Guardando...
-                        </>
-                      ) : (
-                        '💾 Guardar configuración'
-                      )}
-                    </button>
+                    <div className="action-row fixed-bottom">
+                      <button
+                        className="btn btn-primary"
+                        style={{ flex: 1, padding: '14px', fontSize: '15px' }}
+                        onClick={handleSaveConfig}
+                        disabled={savingConfig}
+                      >
+                        {savingConfig ? (
+                          <>
+                            <div className="btn-spinner" />
+                            Guardando...
+                          </>
+                        ) : (
+                          '💾 Guardar configuración'
+                        )}
+                      </button>
+                    </div>
                   </div>
                 </>
               ) : null}
