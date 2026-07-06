@@ -139,17 +139,7 @@ const DEFAULT_CONFIG: Config = {
 
 const KV_CONFIG_KEY = 'app:config';
 
-// Cache config for performance
-let cachedConfig: Config | null = null;
-let lastCacheTime = 0;
-const CACHE_TTL = 60000; // 1 minute
-
 async function getConfig(): Promise<Config> {
-  const now = Date.now();
-  if (cachedConfig && now - lastCacheTime < CACHE_TTL) {
-    return cachedConfig;
-  }
-
   let config: Config;
   if (kv) {
     const stored = await kv.get(KV_CONFIG_KEY);
@@ -171,8 +161,6 @@ async function getConfig(): Promise<Config> {
     servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
   };
 
-  cachedConfig = config;
-  lastCacheTime = now;
   return config;
 }
 
