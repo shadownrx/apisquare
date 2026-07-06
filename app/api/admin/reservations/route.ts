@@ -4,6 +4,7 @@ import { isAuthenticated } from '@/lib/auth';
 
 interface Reservation {
   id: string;
+  profesional: string;
   servicio: string;
   nombre: string;
   fecha: string;
@@ -106,7 +107,7 @@ export async function DELETE(request: NextRequest) {
 
     const reserva = typeof reservaData === 'string' ? JSON.parse(reservaData) : reservaData;
 
-    const key = `reserva:${reserva.servicio}:${reserva.fecha}:${reserva.hora}`;
+    const key = `reserva:${reserva.profesional}:${reserva.fecha}:${reserva.hora}`;
     await kv.del(key);
     await kv.del(idKey);
 

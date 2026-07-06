@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 
 interface Reservation {
   id: string;
+  profesional: string;
   servicio: string;
   nombre: string;
   fecha: string;
@@ -770,7 +771,12 @@ export default function AdminPage() {
                     <div className="card-divider" />
 
                     <div className="card-info-row">
-                      <span className="info-icon">👤</span>
+                      <span className="info-icon">�‍⚕️</span>
+                      <span className="info-label">Profesional</span>
+                      <span className="info-value">{res.profesional}</span>
+                    </div>
+                    <div className="card-info-row">
+                      <span className="info-icon">�👤</span>
                       <span className="info-label">Cliente</span>
                       <span className="info-value">{res.nombre}</span>
                     </div>
@@ -811,6 +817,7 @@ export default function AdminPage() {
                 ¿Estás seguro de que quieres eliminar esta cita? Esta acción no se puede deshacer.
               </p>
               <div className="modal-detail">
+                <div className="modal-detail-item"><strong>Profesional:</strong> {deleteTarget.profesional}</div>
                 <div className="modal-detail-item"><strong>Servicio:</strong> {deleteTarget.servicio}</div>
                 <div className="modal-detail-item"><strong>Cliente:</strong> {deleteTarget.nombre}</div>
                 <div className="modal-detail-item"><strong>Fecha:</strong> {formatDate(deleteTarget.fecha)}</div>
