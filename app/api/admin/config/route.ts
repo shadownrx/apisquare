@@ -59,19 +59,17 @@ function getKV() {
   return null;
 }
 
-// Local storage for development
-const LOCAL_CONFIG_KEY = 'local:app:config';
+// Local storage for development (server-side global)
+const globalConfig = (global as any)._localAppConfig || DEFAULT_CONFIG;
+if (!(global as any)._localAppConfig) {
+  (global as any)._localAppConfig = globalConfig;
+}
+
 const getLocalConfig = (): Config => {
-  if (typeof localStorage !== 'undefined') {
-    const stored = localStorage.getItem(LOCAL_CONFIG_KEY);
-    return stored ? JSON.parse(stored) : DEFAULT_CONFIG;
-  }
-  return DEFAULT_CONFIG;
+  return (global as any)._localAppConfig || DEFAULT_CONFIG;
 };
 const setLocalConfig = (config: Config) => {
-  if (typeof localStorage !== 'undefined') {
-    localStorage.setItem(LOCAL_CONFIG_KEY, JSON.stringify(config));
-  }
+  (global as any)._localAppConfig = config;
 };
 
 export async function GET(request: NextRequest) {
