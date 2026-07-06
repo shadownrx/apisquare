@@ -13,11 +13,38 @@ interface Reservation {
   chatId: number;
 }
 
+interface TimeSlot {
+  inicio: string;
+  fin: string;
+}
+
+interface ProfessionalSchedule {
+  [day: number]: TimeSlot[];
+}
+
+interface Config {
+  profesionales: {
+    [name: string]: ProfessionalSchedule;
+  };
+  feriados: string[];
+  servicios: Array<{ nombre: string; duracionMinutos: number; precio: number }>;
+}
+
 const SERVICE_ICONS: Record<string, string> = {
   'Sesión de Quiropráctica': '🦴',
   'Masaje Relajante': '💆',
   'Traumatología': '🩺',
 };
+
+const DAYS = [
+  { id: 0, name: 'Domingo' },
+  { id: 1, name: 'Lunes' },
+  { id: 2, name: 'Martes' },
+  { id: 3, name: 'Miércoles' },
+  { id: 4, name: 'Jueves' },
+  { id: 5, name: 'Viernes' },
+  { id: 6, name: 'Sábado' },
+];
 
 function formatDate(fechaStr: string): string {
   const fecha = new Date(fechaStr + 'T12:00:00');
@@ -42,6 +69,7 @@ function isFuture(fechaStr: string): boolean {
 
 export default function AdminPage() {
   const router = useRouter();
+  const [activeTab, setActiveTab] = useState<'reservas' | 'config'>('reservas');
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -49,6 +77,13 @@ export default function AdminPage() {
   const [deleting, setDeleting] = useState(false);
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
   const [mounted, setMounted] = useState(false);
+  
+  // Config state
+  const [config, setConfig] = useState<Config | null>(null);
+  const [loadingConfig, setLoadingConfig] = useState(false);
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [editingProf, setEditingProf] = useState<string | null>(null);
+  const [newFeriado, setNewFeriado] = useState('');
 
   useEffect(() => {
     setMounted(true);
@@ -74,9 +109,33 @@ export default function AdminPage() {
     }
   }, [router]);
 
+  const fetchConfig = useCallback(async (isRefresh = false) => {
+    if (isRefresh) setRefreshing(true);
+    else setLoadingConfig(true);
+
+    try {
+      const res = await fetch('/api/admin/config', { cache: 'no-store' });
+      if (res.status === 401) {
+        router.push('/login');
+        return;
+      }
+      const data = await res.json();
+      setConfig(data.config);
+    } catch {
+      showToast('Error al cargar la configuración', 'error');
+    } finally {
+      setLoadingConfig(false);
+      setRefreshing(false);
+    }
+  }, [router]);
+
   useEffect(() => {
-    fetchReservations();
-  }, [fetchReservations]);
+    if (activeTab === 'reservas') {
+      fetchReservations();
+    } else {
+      fetchConfig();
+    }
+  }, [activeTab, fetchReservations, fetchConfig]);
 
   function showToast(msg: string, type: 'success' | 'error') {
     setToast({ msg, type });
@@ -111,12 +170,112 @@ export default function AdminPage() {
     router.push('/login');
   }
 
+  async function handleSaveConfig() {
+    if (!config) return;
+    setSavingConfig(true);
+    try {
+      const res = await fetch('/api/admin/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config),
+      });
+      if (res.ok) {
+        showToast('Configuración guardada correctamente ✓', 'success');
+      } else {
+        showToast('Error al guardar la configuración', 'error');
+      }
+    } catch {
+      showToast('Error de conexión', 'error');
+    } finally {
+      setSavingConfig(false);
+    }
+  }
+
+  function addFeriado() {
+    if (!config || !newFeriado) return;
+    if (!config.feriados.includes(newFeriado)) {
+      setConfig({
+        ...config,
+        feriados: [...config.feriados, newFeriado].sort(),
+      });
+      setNewFeriado('');
+    }
+  }
+
+  function removeFeriado(feriado: string) {
+    if (!config) return;
+    setConfig({
+      ...config,
+      feriados: config.feriados.filter(f => f !== feriado),
+    });
+  }
+
+  function updateProfSchedule(prof: string, day: number, slots: TimeSlot[]) {
+    if (!config) return;
+    setConfig({
+      ...config,
+      profesionales: {
+        ...config.profesionales,
+        [prof]: {
+          ...config.profesionales[prof],
+          [day]: slots,
+        },
+      },
+    });
+  }
+
+  function addSlot(prof: string, day: number) {
+    if (!config) return;
+    const currentSlots = config.profesionales[prof]?.[day] || [];
+    updateProfSchedule(prof, day, [...currentSlots, { inicio: '09:00', fin: '10:00' }]);
+  }
+
+  function removeSlot(prof: string, day: number, index: number) {
+    if (!config) return;
+    const currentSlots = config.profesionales[prof]?.[day] || [];
+    updateProfSchedule(prof, day, currentSlots.filter((_, i) => i !== index));
+  }
+
+  function updateSlot(prof: string, day: number, index: number, field: 'inicio' | 'fin', value: string) {
+    if (!config) return;
+    const currentSlots = config.profesionales[prof]?.[day] || [];
+    const updatedSlots = [...currentSlots];
+    updatedSlots[index] = { ...updatedSlots[index], [field]: value };
+    updateProfSchedule(prof, day, updatedSlots);
+  }
+
+  function addService() {
+    if (!config) return;
+    setConfig({
+      ...config,
+      servicios: [...config.servicios, { nombre: 'Nuevo servicio', duracionMinutos: 30, precio: 5000 }],
+    });
+  }
+
+  function removeService(index: number) {
+    if (!config) return;
+    setConfig({
+      ...config,
+      servicios: config.servicios.filter((_, i) => i !== index),
+    });
+  }
+
+  function updateService(index: number, field: keyof Config['servicios'][0], value: any) {
+    if (!config) return;
+    const updatedServices = [...config.servicios];
+    updatedServices[index] = { ...updatedServices[index], [field]: value };
+    setConfig({
+      ...config,
+      servicios: updatedServices,
+    });
+  }
+
   const todayCount = reservations.filter(r => isToday(r.fecha)).length;
   const upcomingCount = reservations.filter(r => isFuture(r.fecha)).length;
 
   return (
     <>
-      <style>{`
+      <style jsx>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -128,7 +287,7 @@ export default function AdminPage() {
           color: #e2e8f0;
         }
 
-        /* ── Header ───────────────────────────────── */
+        /* Header */
         .admin-header {
           background: rgba(15,23,42,0.95);
           backdrop-filter: blur(20px);
@@ -177,18 +336,24 @@ export default function AdminPage() {
           gap: 10px;
         }
 
-        .btn-refresh {
+        .btn {
           display: flex; align-items: center; gap: 7px;
           padding: 8px 16px;
           font-size: 13px;
           font-weight: 500;
           font-family: 'Inter', sans-serif;
-          background: rgba(99,102,241,0.15);
-          color: #a5b4fc;
-          border: 1px solid rgba(99,102,241,0.3);
           border-radius: 8px;
           cursor: pointer;
           transition: all 0.2s;
+          border: 1px solid transparent;
+        }
+
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-refresh {
+          background: rgba(99,102,241,0.15);
+          color: #a5b4fc;
+          border-color: rgba(99,102,241,0.3);
         }
 
         .btn-refresh:hover:not(:disabled) {
@@ -197,7 +362,16 @@ export default function AdminPage() {
           color: #c7d2fe;
         }
 
-        .btn-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-logout {
+          background: rgba(239,68,68,0.1);
+          color: #fca5a5;
+          border-color: rgba(239,68,68,0.25);
+        }
+
+        .btn-logout:hover {
+          background: rgba(239,68,68,0.2);
+          border-color: rgba(239,68,68,0.4);
+        }
 
         .refresh-icon {
           font-size: 14px;
@@ -211,37 +385,46 @@ export default function AdminPage() {
 
         @keyframes spin { to { transform: rotate(360deg); } }
 
-        .btn-logout {
-          display: flex; align-items: center; gap: 7px;
-          padding: 8px 16px;
-          font-size: 13px;
-          font-weight: 500;
-          font-family: 'Inter', sans-serif;
-          background: rgba(239,68,68,0.1);
-          color: #fca5a5;
-          border: 1px solid rgba(239,68,68,0.25);
-          border-radius: 8px;
+        /* Tabs */
+        .tabs {
+          display: flex;
+          gap: 8px;
+          padding: 0 32px;
+          margin-top: 24px;
+          border-bottom: 1px solid rgba(255,255,255,0.07);
+        }
+
+        .tab {
+          padding: 12px 20px;
+          font-size: 14px;
+          font-weight: 600;
+          color: rgba(148,163,184,0.7);
           cursor: pointer;
+          border-bottom: 2px solid transparent;
           transition: all 0.2s;
         }
 
-        .btn-logout:hover {
-          background: rgba(239,68,68,0.2);
-          border-color: rgba(239,68,68,0.4);
+        .tab:hover {
+          color: #e2e8f0;
         }
 
-        /* ── Main content ─────────────────────────── */
+        .tab.active {
+          color: #818cf8;
+          border-bottom-color: #818cf8;
+        }
+
+        /* Main content */
         .admin-main {
           max-width: 1280px;
           margin: 0 auto;
-          padding: 40px 32px;
+          padding: 32px;
         }
 
         .section-header {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          margin-bottom: 32px;
+          margin-bottom: 24px;
         }
 
         .section-title {
@@ -257,7 +440,7 @@ export default function AdminPage() {
           margin-top: 4px;
         }
 
-        /* ── Stats ────────────────────────────────── */
+        /* Stats */
         .stats-grid {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -305,7 +488,7 @@ export default function AdminPage() {
           margin-bottom: 10px;
         }
 
-        /* ── Reservations Grid ────────────────────── */
+        /* Reservations Grid */
         .reservations-grid {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -411,7 +594,7 @@ export default function AdminPage() {
           color: rgba(148,163,184,0.6);
           text-transform: uppercase;
           letter-spacing: 0.5px;
-          width: 56px;
+          width: 70px;
           flex-shrink: 0;
         }
 
@@ -449,7 +632,7 @@ export default function AdminPage() {
           color: #fecaca;
         }
 
-        /* ── Empty State ──────────────────────────── */
+        /* Empty State */
         .empty-state {
           text-align: center;
           padding: 80px 20px;
@@ -474,7 +657,7 @@ export default function AdminPage() {
           color: rgba(100,116,139,0.7);
         }
 
-        /* ── Loading ──────────────────────────────── */
+        /* Loading */
         .loading-grid {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -501,7 +684,7 @@ export default function AdminPage() {
           margin-bottom: 10px;
         }
 
-        /* ── Modal ────────────────────────────────── */
+        /* Modal */
         .modal-overlay {
           position: fixed;
           inset: 0;
@@ -638,7 +821,7 @@ export default function AdminPage() {
           animation: spin 0.7s linear infinite;
         }
 
-        /* ── Toast ────────────────────────────────── */
+        /* Toast */
         .toast {
           position: fixed;
           bottom: 28px;
@@ -672,6 +855,194 @@ export default function AdminPage() {
           from { opacity: 0; transform: translateY(12px) scale(0.95); }
           to { opacity: 1; transform: translateY(0) scale(1); }
         }
+
+        /* Config Section */
+        .config-section {
+          margin-bottom: 32px;
+        }
+
+        .config-card {
+          background: rgba(255,255,255,0.04);
+          border: 1px solid rgba(255,255,255,0.08);
+          border-radius: 16px;
+          padding: 24px;
+          margin-bottom: 20px;
+        }
+
+        .config-title {
+          font-size: 18px;
+          font-weight: 700;
+          color: #f8fafc;
+          margin-bottom: 16px;
+        }
+
+        .config-subtitle {
+          font-size: 13px;
+          color: rgba(148,163,184,0.7);
+          margin-bottom: 16px;
+        }
+
+        .input {
+          width: 100%;
+          padding: 10px 14px;
+          font-size: 14px;
+          font-family: 'Inter', sans-serif;
+          background: rgba(255,255,255,0.05);
+          border: 1px solid rgba(255,255,255,0.1);
+          border-radius: 8px;
+          color: #e2e8f0;
+          outline: none;
+          transition: all 0.2s;
+        }
+
+        .input:focus {
+          border-color: #818cf8;
+          box-shadow: 0 0 0 3px rgba(129,140,248,0.15);
+        }
+
+        .input::placeholder {
+          color: rgba(148,163,184,0.5);
+        }
+
+        .btn-primary {
+          background: linear-gradient(135deg, #6366f1, #8b5cf6);
+          color: #fff;
+          border: none;
+          font-weight: 600;
+          box-shadow: 0 4px 12px rgba(99,102,241,0.3);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+          opacity: 0.9;
+          transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+          background: rgba(99,102,241,0.1);
+          color: #a5b4fc;
+          border-color: rgba(99,102,241,0.3);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+          background: rgba(99,102,241,0.2);
+          color: #c7d2fe;
+        }
+
+        .btn-danger {
+          background: rgba(239,68,68,0.1);
+          color: #fca5a5;
+          border-color: rgba(239,68,68,0.3);
+        }
+
+        .btn-danger:hover:not(:disabled) {
+          background: rgba(239,68,68,0.2);
+          color: #fecaca;
+        }
+
+        .btn-small {
+          padding: 6px 12px;
+          font-size: 12px;
+        }
+
+        .feriados-list {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 16px;
+        }
+
+        .feriado-badge {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 14px;
+          background: rgba(245,158,11,0.1);
+          border: 1px solid rgba(245,158,11,0.3);
+          border-radius: 8px;
+          color: #fbbf24;
+          font-size: 13px;
+        }
+
+        .feriado-badge button {
+          background: transparent;
+          border: none;
+          color: #fca5a5;
+          cursor: pointer;
+          font-size: 16px;
+          padding: 0;
+        }
+
+        .prof-card {
+          background: rgba(255,255,255,0.03);
+          border: 1px solid rgba(255,255,255,0.06);
+          border-radius: 12px;
+          padding: 20px;
+          margin-bottom: 16px;
+        }
+
+        .prof-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 16px;
+        }
+
+        .prof-name {
+          font-size: 16px;
+          font-weight: 700;
+          color: #f1f5f9;
+        }
+
+        .day-section {
+          margin-bottom: 16px;
+        }
+
+        .day-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 8px;
+          font-size: 14px;
+          font-weight: 600;
+          color: #94a3b8;
+        }
+
+        .slots-list {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .slot-row {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }
+
+        .slot-input {
+          flex: 1;
+          padding: 8px 12px;
+          font-size: 13px;
+        }
+
+        .service-row {
+          display: grid;
+          grid-template-columns: 2fr 1fr 1fr auto;
+          gap: 12px;
+          align-items: center;
+          margin-bottom: 12px;
+        }
+
+        .service-row .input {
+          padding: 8px 12px;
+          font-size: 13px;
+        }
+
+        .action-row {
+          display: flex;
+          gap: 10px;
+          margin-top: 20px;
+        }
       `}</style>
 
       <div className="admin-root">
@@ -685,125 +1056,335 @@ export default function AdminPage() {
             </div>
           </div>
           <div className="header-actions">
-            <button
-              id="btn-refresh"
-              className="btn-refresh"
-              onClick={() => fetchReservations(true)}
-              disabled={refreshing || loading}
-            >
-              <span className={`refresh-icon ${refreshing ? 'spinning' : ''}`}>↻</span>
-              {refreshing ? 'Actualizando...' : 'Refrescar'}
-            </button>
-            <button id="btn-logout" className="btn-logout" onClick={handleLogout}>
+            {activeTab === 'reservas' && (
+              <button
+                id="btn-refresh"
+                className="btn btn-refresh"
+                onClick={() => fetchReservations(true)}
+                disabled={refreshing || loading}
+              >
+                <span className={`refresh-icon ${refreshing ? 'spinning' : ''}`}>↻</span>
+                {refreshing ? 'Actualizando...' : 'Refrescar'}
+              </button>
+            )}
+            {activeTab === 'config' && (
+              <button
+                id="btn-refresh-config"
+                className="btn btn-refresh"
+                onClick={() => fetchConfig(true)}
+                disabled={refreshing || loadingConfig}
+              >
+                <span className={`refresh-icon ${refreshing ? 'spinning' : ''}`}>↻</span>
+                {refreshing ? 'Actualizando...' : 'Refrescar'}
+              </button>
+            )}
+            <button id="btn-logout" className="btn btn-logout" onClick={handleLogout}>
               ⎋ Cerrar sesión
             </button>
           </div>
         </header>
 
+        {/* Tabs */}
+        <div className="tabs">
+          <div
+            className={`tab ${activeTab === 'reservas' ? 'active' : ''}`}
+            onClick={() => setActiveTab('reservas')}
+          >
+            📋 Reservas
+          </div>
+          <div
+            className={`tab ${activeTab === 'config' ? 'active' : ''}`}
+            onClick={() => setActiveTab('config')}
+          >
+            ⚙️ Configuración
+          </div>
+        </div>
+
         {/* Main */}
         <main className="admin-main">
-          <div className="section-header">
-            <div>
-              <h1 className="section-title">Reservas</h1>
-              <p className="section-subtitle">
-                {loading ? 'Cargando...' : `${reservations.length} cita${reservations.length !== 1 ? 's' : ''} en total`}
-              </p>
-            </div>
-          </div>
-
-          {/* Stats */}
-          <div className="stats-grid">
-            {[
-              { label: 'Total', value: reservations.length, icon: '📋', cls: 'accent' },
-              { label: 'Hoy', value: todayCount, icon: '📅', cls: 'green' },
-              { label: 'Próximas', value: upcomingCount, icon: '⏳', cls: '' },
-            ].map((stat, i) => (
-              <div
-                key={stat.label}
-                className={`stat-card ${mounted ? 'visible' : ''}`}
-                style={{ transitionDelay: `${i * 80}ms` }}
-              >
-                <div className="stat-icon">{stat.icon}</div>
-                <div className="stat-label">{stat.label}</div>
-                <div className={`stat-value ${stat.cls}`}>{stat.value}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* Reservations */}
-          {loading ? (
-            <div className="loading-grid">
-              {[1, 2, 3].map(i => (
-                <div key={i} className="skeleton-card">
-                  <div className="skeleton-line" style={{ width: '40%', height: 18, marginBottom: 18 }} />
-                  <div className="skeleton-line" style={{ width: '70%' }} />
-                  <div className="skeleton-line" style={{ width: '55%' }} />
-                  <div className="skeleton-line" style={{ width: '45%' }} />
+          {activeTab === 'reservas' && (
+            <>
+              <div className="section-header">
+                <div>
+                  <h1 className="section-title">Reservas</h1>
+                  <p className="section-subtitle">
+                    {loading ? 'Cargando...' : `${reservations.length} cita${reservations.length !== 1 ? 's' : ''} en total`}
+                  </p>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <div className="reservations-grid">
-              {reservations.length === 0 ? (
-                <div className="empty-state">
-                  <div className="empty-icon">📭</div>
-                  <p className="empty-title">No hay reservas aún</p>
-                  <p className="empty-subtitle">Las nuevas citas aparecerán aquí automáticamente</p>
+              </div>
+
+              {/* Stats */}
+              <div className="stats-grid">
+                {[
+                  { label: 'Total', value: reservations.length, icon: '📋', cls: 'accent' },
+                  { label: 'Hoy', value: todayCount, icon: '📅', cls: 'green' },
+                  { label: 'Próximas', value: upcomingCount, icon: '⏳', cls: '' },
+                ].map((stat, i) => (
+                  <div
+                    key={stat.label}
+                    className={`stat-card ${mounted ? 'visible' : ''}`}
+                    style={{ transitionDelay: `${i * 80}ms` }}
+                  >
+                    <div className="stat-icon">{stat.icon}</div>
+                    <div className="stat-label">{stat.label}</div>
+                    <div className={`stat-value ${stat.cls}`}>{stat.value}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Reservations */}
+              {loading ? (
+                <div className="loading-grid">
+                  {[1, 2, 3].map(i => (
+                    <div key={i} className="skeleton-card">
+                      <div className="skeleton-line" style={{ width: '40%', height: 18, marginBottom: 18 }} />
+                      <div className="skeleton-line" style={{ width: '70%' }} />
+                      <div className="skeleton-line" style={{ width: '55%' }} />
+                      <div className="skeleton-line" style={{ width: '45%' }} />
+                    </div>
+                  ))}
                 </div>
               ) : (
-                reservations.map((res, index) => (
-                  <div
-                    key={res.id}
-                    className={`reservation-card ${mounted ? 'visible' : ''}`}
-                    style={{ transitionDelay: `${index * 60}ms` }}
-                  >
-                    {isToday(res.fecha) && (
-                      <div className="card-today-badge">HOY</div>
-                    )}
-
-                    <div className="card-service-header">
-                      <div className="service-icon">
-                        {SERVICE_ICONS[res.servicio] || '🩺'}
-                      </div>
-                      <div className="service-name">{res.servicio}</div>
+                <div className="reservations-grid">
+                  {reservations.length === 0 ? (
+                    <div className="empty-state">
+                      <div className="empty-icon">📭</div>
+                      <p className="empty-title">No hay reservas aún</p>
+                      <p className="empty-subtitle">Las nuevas citas aparecerán aquí automáticamente</p>
                     </div>
-
-                    <div className="card-divider" />
-
-                    <div className="card-info-row">
-                      <span className="info-icon">�‍⚕️</span>
-                      <span className="info-label">Profesional</span>
-                      <span className="info-value">{res.profesional}</span>
-                    </div>
-                    <div className="card-info-row">
-                      <span className="info-icon">�👤</span>
-                      <span className="info-label">Cliente</span>
-                      <span className="info-value">{res.nombre}</span>
-                    </div>
-                    <div className="card-info-row">
-                      <span className="info-icon">📅</span>
-                      <span className="info-label">Fecha</span>
-                      <span className="info-value">{formatDate(res.fecha)}</span>
-                    </div>
-                    <div className="card-info-row">
-                      <span className="info-icon">🕐</span>
-                      <span className="info-label">Hora</span>
-                      <span className="info-value">{res.hora}</span>
-                    </div>
-
-                    <div className="card-footer">
-                      <button
-                        id={`btn-delete-${res.id}`}
-                        className="btn-delete"
-                        onClick={() => setDeleteTarget(res)}
+                  ) : (
+                    reservations.map((res, index) => (
+                      <div
+                        key={res.id}
+                        className={`reservation-card ${mounted ? 'visible' : ''}`}
+                        style={{ transitionDelay: `${index * 60}ms` }}
                       >
-                        🗑 Eliminar cita
+                        {isToday(res.fecha) && (
+                          <div className="card-today-badge">HOY</div>
+                        )}
+
+                        <div className="card-service-header">
+                          <div className="service-icon">
+                            {SERVICE_ICONS[res.servicio] || '🩺'}
+                          </div>
+                          <div className="service-name">{res.servicio}</div>
+                        </div>
+
+                        <div className="card-divider" />
+
+                        <div className="card-info-row">
+                          <span className="info-icon">👨‍⚕️</span>
+                          <span className="info-label">Profesional</span>
+                          <span className="info-value">{res.profesional}</span>
+                        </div>
+                        <div className="card-info-row">
+                          <span className="info-icon">👤</span>
+                          <span className="info-label">Cliente</span>
+                          <span className="info-value">{res.nombre}</span>
+                        </div>
+                        <div className="card-info-row">
+                          <span className="info-icon">📅</span>
+                          <span className="info-label">Fecha</span>
+                          <span className="info-value">{formatDate(res.fecha)}</span>
+                        </div>
+                        <div className="card-info-row">
+                          <span className="info-icon">🕐</span>
+                          <span className="info-label">Hora</span>
+                          <span className="info-value">{res.hora}</span>
+                        </div>
+
+                        <div className="card-footer">
+                          <button
+                            id={`btn-delete-${res.id}`}
+                            className="btn btn-delete"
+                            onClick={() => setDeleteTarget(res)}
+                          >
+                            🗑️ Eliminar cita
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
+          {activeTab === 'config' && (
+            <>
+              <div className="section-header">
+                <div>
+                  <h1 className="section-title">Configuración</h1>
+                  <p className="section-subtitle">
+                    {loadingConfig ? 'Cargando...' : 'Gestiona horarios, feriados y servicios'}
+                  </p>
+                </div>
+              </div>
+
+              {loadingConfig ? (
+                <div className="loading-grid">
+                  <div className="skeleton-card" style={{ gridColumn: '1 / -1', padding: '32px' }}>
+                    <div className="skeleton-line" style={{ width: '30%', height: 20, marginBottom: 24 }} />
+                    <div className="skeleton-line" style={{ width: '80%' }} />
+                    <div className="skeleton-line" style={{ width: '60%' }} />
+                  </div>
+                </div>
+              ) : config ? (
+                <>
+                  {/* Feriados */}
+                  <div className="config-card">
+                    <div className="config-title">🎉 Feriados</div>
+                    <div className="config-subtitle">
+                      Agrega días feriados en los que no habrá atenciones
+                    </div>
+                    <div style={{ display: 'flex', gap: 10 }}>
+                      <input
+                        type="date"
+                        className="input"
+                        value={newFeriado}
+                        onChange={(e) => setNewFeriado(e.target.value)}
+                      />
+                      <button className="btn btn-primary" onClick={addFeriado}>
+                        ➕ Agregar
+                      </button>
+                    </div>
+                    <div className="feriados-list">
+                      {config.feriados.length === 0 ? (
+                        <span style={{ color: 'rgba(148,163,184,0.5)', fontSize: 14 }}>
+                          No hay feriados configurados
+                        </span>
+                      ) : (
+                        config.feriados.map(feriado => (
+                          <div key={feriado} className="feriado-badge">
+                            📅 {formatDate(feriado)}
+                            <button onClick={() => removeFeriado(feriado)}>×</button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Servicios */}
+                  <div className="config-card">
+                    <div className="config-title">🩺 Servicios</div>
+                    <div className="config-subtitle">
+                      Configura los servicios disponibles, su duración y precio
+                    </div>
+                    {config.servicios.map((servicio, index) => (
+                      <div key={index} className="service-row">
+                        <input
+                          type="text"
+                          className="input"
+                          placeholder="Nombre del servicio"
+                          value={servicio.nombre}
+                          onChange={(e) => updateService(index, 'nombre', e.target.value)}
+                        />
+                        <input
+                          type="number"
+                          className="input"
+                          placeholder="Duración (min)"
+                          value={servicio.duracionMinutos}
+                          onChange={(e) => updateService(index, 'duracionMinutos', parseInt(e.target.value) || 30)}
+                        />
+                        <input
+                          type="number"
+                          className="input"
+                          placeholder="Precio"
+                          value={servicio.precio}
+                          onChange={(e) => updateService(index, 'precio', parseInt(e.target.value) || 0)}
+                        />
+                        <button
+                          className="btn btn-danger btn-small"
+                          onClick={() => removeService(index)}
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    ))}
+                    <div className="action-row">
+                      <button className="btn btn-secondary" onClick={addService}>
+                        ➕ Agregar servicio
                       </button>
                     </div>
                   </div>
-                ))
-              )}
-            </div>
+
+                  {/* Profesionales */}
+                  <div className="config-card">
+                    <div className="config-title">👨‍⚕️ Horarios de profesionales</div>
+                    <div className="config-subtitle">
+                      Configura los horarios de atención de cada profesional
+                    </div>
+                    {Object.entries(config.profesionales).map(([prof, schedule]) => (
+                      <div key={prof} className="prof-card">
+                        <div className="prof-header">
+                          <div className="prof-name">{prof}</div>
+                        </div>
+                        {DAYS.map(day => (
+                          <div key={day.id} className="day-section">
+                            <div className="day-header">
+                              <span>{day.name}</span>
+                              <button
+                                className="btn btn-secondary btn-small"
+                                onClick={() => addSlot(prof, day.id)}
+                              >
+                                ➕ Agregar horario
+                              </button>
+                            </div>
+                            <div className="slots-list">
+                              {(schedule[day.id] || []).map((slot, slotIndex) => (
+                                <div key={slotIndex} className="slot-row">
+                                  <input
+                                    type="time"
+                                    className="input slot-input"
+                                    value={slot.inicio}
+                                    onChange={(e) => updateSlot(prof, day.id, slotIndex, 'inicio', e.target.value)}
+                                  />
+                                  <span style={{ color: '#94a3b8' }}>a</span>
+                                  <input
+                                    type="time"
+                                    className="input slot-input"
+                                    value={slot.fin}
+                                    onChange={(e) => updateSlot(prof, day.id, slotIndex, 'fin', e.target.value)}
+                                  />
+                                  <button
+                                    className="btn btn-danger btn-small"
+                                    onClick={() => removeSlot(prof, day.id, slotIndex)}
+                                  >
+                                    🗑️
+                                  </button>
+                                </div>
+                              ))}
+                              {(!schedule[day.id] || schedule[day.id].length === 0) && (
+                                <span style={{ color: 'rgba(148,163,184,0.5)', fontSize: 13 }}>
+                                  No hay horarios configurados para este día
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="action-row">
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleSaveConfig}
+                      disabled={savingConfig}
+                    >
+                      {savingConfig ? (
+                        <>
+                          <div className="btn-spinner" />
+                          Guardando...
+                        </>
+                      ) : (
+                        '💾 Guardar configuración'
+                      )}
+                    </button>
+                  </div>
+                </>
+              ) : null}
+            </>
           )}
         </main>
 

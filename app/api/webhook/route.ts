@@ -92,47 +92,128 @@ async function checkUserRateLimit(chatId: number): Promise<boolean> {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Profesionales y Servicios
-const PROFESIONALES = ['Francisco Chibilisco', 'Javier Martoni'];
-
-const SERVICIOS = [
-  { nombre: 'Sesión de Quiropraxia', duracionMinutos: 25, precio: 30000 },
-  { nombre: 'Sesión de Masajes', duracionMinutos: 45, precio: 30000 },
-  { nombre: 'Sesión Premium', duracionMinutos: 60, precio: 55000 }
-];
-
-function getServicio(nombre: string) {
-  return SERVICIOS.find(s => s.nombre.toLowerCase() === nombre.toLowerCase());
+// Interfaces for config
+interface TimeSlot {
+  inicio: string;
+  fin: string;
 }
 
-// Devuelve array de { inicio, fin } para un profesional y día (0=Dom, 1=Lun, ..., 6=Sab)
-function getHorarioProfesional(profesional: string, dia: number): Array<{ inicio: string, fin: string }> {
-  if (profesional === 'Francisco Chibilisco') {
-    const horarios: Array<{ inicio: string, fin: string }> = [];
-    if (dia >= 1 && dia <= 5) {
-      horarios.push({ inicio: '11:00', fin: '13:00' });
-    }
-    if (dia === 4 || dia === 5) {
-      horarios.push({ inicio: '15:00', fin: '20:00' });
-    }
-    if (dia === 6) {
-      horarios.push({ inicio: '09:00', fin: '13:00' });
-    }
-    return horarios;
-  }
-  if (profesional === 'Javier Martoni') {
-    if (dia >= 1 && dia <= 5) {
-      return [{ inicio: '15:30', fin: '20:00' }];
-    }
-    return [];
-  }
-  return [];
+interface ProfessionalSchedule {
+  [day: number]: TimeSlot[];
 }
 
-function esDiaLaborable(fechaStr: string, profesional?: string): boolean {
-  if (!profesional) return true;
+interface Config {
+  profesionales: {
+    [name: string]: ProfessionalSchedule;
+  };
+  feriados: string[];
+  servicios: Array<{ nombre: string; duracionMinutos: number; precio: number }>;
+}
+
+// Default config
+const DEFAULT_CONFIG: Config = {
+  profesionales: {
+    'Francisco Chibilisco': {
+      1: [{ inicio: '11:00', fin: '13:00' }],
+      2: [{ inicio: '11:00', fin: '13:00' }],
+      3: [{ inicio: '11:00', fin: '13:00' }],
+      4: [{ inicio: '11:00', fin: '13:00' }, { inicio: '15:00', fin: '20:00' }],
+      5: [{ inicio: '11:00', fin: '13:00' }, { inicio: '15:00', fin: '20:00' }],
+      6: [{ inicio: '09:00', fin: '13:00' }],
+    },
+    'Javier Martoni': {
+      1: [{ inicio: '15:30', fin: '20:00' }],
+      2: [{ inicio: '15:30', fin: '20:00' }],
+      3: [{ inicio: '15:30', fin: '20:00' }],
+      4: [{ inicio: '15:30', fin: '20:00' }],
+      5: [{ inicio: '15:30', fin: '20:00' }],
+    }
+  },
+  feriados: [],
+  servicios: [
+    { nombre: 'Sesión de Quiropraxia', duracionMinutos: 25, precio: 30000 },
+    { nombre: 'Masaje Relajante', duracionMinutos: 45, precio: 30000 },
+    { nombre: 'Sesión Premium', duracionMinutos: 60, precio: 55000 }
+  ]
+};
+
+const KV_CONFIG_KEY = 'app:config';
+
+// Cache config for performance
+let cachedConfig: Config | null = null;
+let lastCacheTime = 0;
+const CACHE_TTL = 60000; // 1 minute
+
+async function getConfig(): Promise<Config> {
+  const now = Date.now();
+  if (cachedConfig && now - lastCacheTime < CACHE_TTL) {
+    return cachedConfig;
+  }
+
+  let config: Config;
+  if (kv) {
+    const stored = await kv.get(KV_CONFIG_KEY);
+    config = stored ? (typeof stored === 'string' ? JSON.parse(stored) : stored) : DEFAULT_CONFIG;
+  } else {
+    // Local config for dev
+    const localConfig = (global as any)._localAppConfig;
+    config = localConfig || DEFAULT_CONFIG;
+  }
+
+  // Merge with default
+  config = {
+    ...DEFAULT_CONFIG,
+    ...config,
+    profesionales: {
+      ...DEFAULT_CONFIG.profesionales,
+      ...config.profesionales
+    },
+    servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
+  };
+
+  cachedConfig = config;
+  lastCacheTime = now;
+  return config;
+}
+
+async function getProfesionales() {
+  const config = await getConfig();
+  return Object.keys(config.profesionales);
+}
+
+async function getServiciosList() {
+  const config = await getConfig();
+  return config.servicios;
+}
+
+async function getServicio(nombre: string) {
+  const servicios = await getServiciosList();
+  return servicios.find(s => s.nombre.toLowerCase() === nombre.toLowerCase());
+}
+
+async function getHorarioProfesional(profesional: string, dia: number): Promise<Array<{ inicio: string, fin: string }>> {
+  const config = await getConfig();
+  const profSchedule = config.profesionales[profesional];
+  return profSchedule?.[dia] || [];
+}
+
+async function isFeriado(fechaStr: string): Promise<boolean> {
+  const config = await getConfig();
+  return config.feriados.includes(fechaStr);
+}
+
+async function esDiaLaborable(fechaStr: string, profesional?: string): Promise<boolean> {
+  const esFeriadoFlag = await isFeriado(fechaStr);
+  if (esFeriadoFlag) return false;
+  
+  if (!profesional) {
+    const dia = new Date(fechaStr + 'T12:00:00').getDay();
+    return dia >= 1 && dia <= 6;
+  }
+  
   const dia = new Date(fechaStr + 'T12:00:00').getDay();
-  return getHorarioProfesional(profesional, dia).length > 0;
+  const horarios = await getHorarioProfesional(profesional, dia);
+  return horarios.length > 0;
 }
 
 // Función para formatear fecha de forma legible
@@ -165,15 +246,28 @@ function addDays(date: Date, days: number): Date {
   return d;
 }
 
-function proximosDiasLaborables(cantidad: number, profesional?: string): { fecha: string; label: string }[] {
+async function proximosDiasLaborables(cantidad: number, profesional?: string): Promise<{ fecha: string; label: string }[]> {
   const dias: { fecha: string; label: string }[] = [];
   const today = getToday();
   let offset = 0;
 
   while (dias.length < cantidad && offset < 30) {
     const candidate = addDays(today, offset);
+    const candidateFechaStr = toDateStr(candidate);
     const day = candidate.getDay();
-    const works = profesional ? (getHorarioProfesional(profesional, day).length > 0) : (day >= 1 && day <= 6);
+    let works: boolean;
+    if (profesional) {
+      const esFeriadoFlag = await isFeriado(candidateFechaStr);
+      if (esFeriadoFlag) {
+        works = false;
+      } else {
+        const horarios = await getHorarioProfesional(profesional, day);
+        works = horarios.length > 0;
+      }
+    } else {
+      const esFeriadoFlag = await isFeriado(candidateFechaStr);
+      works = !esFeriadoFlag && (day >= 1 && day <= 6);
+    }
     
     if (works) {
       let label: string;
@@ -187,15 +281,15 @@ function proximosDiasLaborables(cantidad: number, profesional?: string): { fecha
         const month = candidate.toLocaleDateString('es-ES', { month: 'short' });
         label = `${weekday.charAt(0).toUpperCase() + weekday.slice(1)} ${d} ${month.charAt(0).toUpperCase() + month.slice(1)}`;
       }
-      dias.push({ fecha: toDateStr(candidate), label });
+      dias.push({ fecha: candidateFechaStr, label });
     }
     offset++;
   }
   return dias;
 }
 
-function buildFechasKeyboard(profesional?: string) {
-  const dias = proximosDiasLaborables(8, profesional);
+async function buildFechasKeyboard(profesional?: string) {
+  const dias = await proximosDiasLaborables(8, profesional);
   const keyboard = [];
   for (let i = 0; i < dias.length; i += 2) {
     keyboard.push(
@@ -209,12 +303,12 @@ function buildFechasKeyboard(profesional?: string) {
   return keyboard;
 }
 
-function buildFechasView(servicio?: string, profesional?: string) {
+async function buildFechasView(servicio?: string, profesional?: string) {
   return {
     text: servicio
       ? `📅 *${servicio}*\n\n¿Qué día preferís?`
       : '📅 ¿Qué día te gustaría?',
-    keyboard: buildFechasKeyboard(profesional)
+    keyboard: await buildFechasKeyboard(profesional)
   };
 }
 
@@ -279,7 +373,7 @@ async function haySolapamiento(profesional: string, fechaStr: string, startMinut
   
   for (const reserva of reservasDelDia) {
     const reservaStart = horaAMinutos(reserva.hora);
-    const reservaServicio = getServicio(reserva.servicio);
+    const reservaServicio = await getServicio(reserva.servicio);
     const reservaDuracion = reservaServicio ? reservaServicio.duracionMinutos : 60;
     const reservaEnd = reservaStart + reservaDuracion;
     
@@ -295,10 +389,10 @@ async function haySolapamiento(profesional: string, fechaStr: string, startMinut
 async function obtenerHorariosLibres(fechaStr: string, profesional: string, servicioNombre: string): Promise<string[]> {
   const libres: string[] = [];
   const dia = new Date(fechaStr + 'T12:00:00').getDay();
-  const horarios = getHorarioProfesional(profesional, dia);
+  const horarios = await getHorarioProfesional(profesional, dia);
   if (horarios.length === 0) return libres;
   
-  const servicio = getServicio(servicioNombre);
+  const servicio = await getServicio(servicioNombre);
   if (!servicio) return libres;
   
   for (const horario of horarios) {
@@ -330,7 +424,6 @@ async function buildHorariosView(fechaStr: string, servicio: string, profesional
   const horariosLibres = await obtenerHorariosLibres(fechaStr, profesional, servicio);
 
   if (horariosLibres.length === 0) {
-    const otras = SERVICIOS.filter(s => s.nombre !== servicio);
     return {
       text:
         `😕 No hay turnos disponibles para *${servicio}* el ${formatDate(fechaStr)} con ${profesional}.\n\n` +
@@ -362,8 +455,8 @@ async function buildHorariosView(fechaStr: string, servicio: string, profesional
 }
 
 // ── Vista de confirmación ────────────────────────────────────────────────────
-function buildConfirmacionView(estado: ConversationState) {
-  const serv = getServicio(estado.servicio || '');
+async function buildConfirmacionView(estado: ConversationState) {
+  const serv = await getServicio(estado.servicio || '');
   return {
     text:
       `✅ *Confirmá tu turno*\n\n` +
@@ -390,11 +483,18 @@ async function verificarDisponibilidad(profesional: string, servicio: string, fe
     const fecha = new Date(fechaStr + 'T12:00:00');
     const dia = fecha.getDay();
 
-    if (getHorarioProfesional(profesional, dia).length === 0) {
+    // Check if it's a holiday
+    const esFeriadoFlag = await isFeriado(fechaStr);
+    if (esFeriadoFlag) {
+      return { disponible: false, mensaje: 'Ese día es feriado.' };
+    }
+
+    const horarios = await getHorarioProfesional(profesional, dia);
+    if (horarios.length === 0) {
       return { disponible: false, mensaje: 'El profesional no atiende ese día.' };
     }
 
-    const servicioData = getServicio(servicio);
+    const servicioData = await getServicio(servicio);
     if (!servicioData) return { disponible: false, mensaje: 'Servicio no encontrado.' };
 
     const startMinutos = horaAMinutos(horaStr);
@@ -665,14 +765,16 @@ export async function POST(request: NextRequest) {
         ]);
 
       } else if (data === 'profesionales') {
+        const profesionales = await getProfesionales();
         await sendWithKeyboard(
-          '👨‍⚕️ *Nuestros profesionales:*\n\n*Francisco Chibilisco*:\n- Lunes a viernes: 11 a 13 hs\n- Jueves y viernes: también 15 a 20 hs\n- Sábados: 9 a 13 hs\n\n*Javier Martoni*:\n- Lunes a viernes: 15:30 a 20 hs\n\n*(Atención particular, sin obra social)*',
-          PROFESIONALES.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+          '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
+          profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
         );
       } else if (data === 'servicios') {
+        const servicios = await getServiciosList();
         await sendWithKeyboard(
           '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*',
-          SERVICIOS.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
+          servicios.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
         );
 
       } else if (data === 'reservar') {
@@ -683,10 +785,11 @@ export async function POST(request: NextRequest) {
             [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
           );
         } else {
+          const profesionales = await getProfesionales();
           await saveState({ paso: 'profesional' });
           await sendWithKeyboard(
             '¿Con qué profesional te querés atender?',
-            PROFESIONALES.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+            profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
           );
         }
 
@@ -757,10 +860,11 @@ export async function POST(request: NextRequest) {
 
       } else if (data.startsWith('profesional:')) {
         const profSeleccionado = data.replace('profesional:', '');
+        const servicios = await getServiciosList();
         await saveState({ paso: 'servicio', profesional: profSeleccionado });
         await sendWithKeyboard(
           `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
-          SERVICIOS.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
+          servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
         );
       } else if (data.startsWith('servicio:')) {
         const servicioSeleccionado = data.replace('servicio:', '');
@@ -775,7 +879,7 @@ export async function POST(request: NextRequest) {
 
       } else if (data === 'cambiar_fecha') {
         await saveState({ paso: 'fecha', servicio: estado.servicio, nombre: estado.nombre, profesional: estado.profesional });
-        const view = buildFechasView(estado.servicio, estado.profesional);
+        const view = await buildFechasView(estado.servicio, estado.profesional);
         await sendWithKeyboard(view.text, view.keyboard);
 
       } else if (data.startsWith('fecha:')) {
@@ -801,7 +905,7 @@ export async function POST(request: NextRequest) {
         if (disponibilidad.disponible) {
           // Guardar la hora en estado y pasar a confirmación
           await saveState({ ...estado, paso: 'confirmar', hora: horaSeleccionada });
-          const view = buildConfirmacionView({ ...estado, hora: horaSeleccionada });
+          const view = await buildConfirmacionView({ ...estado, hora: horaSeleccionada });
           await sendWithKeyboard(view.text, view.keyboard);
         } else {
           // Slot ocupado: mostrar horarios actualizados
@@ -910,9 +1014,10 @@ export async function POST(request: NextRequest) {
       };
 
       const showServices = async () => {
+        const servicios = await getServiciosList();
         await sendWithKeyboard(
           '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*',
-          SERVICIOS.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
+          servicios.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
         );
       };
 
@@ -986,10 +1091,11 @@ export async function POST(request: NextRequest) {
             [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
           );
         } else {
+          const profesionales = await getProfesionales();
           await saveState({ paso: 'profesional' });
           await sendWithKeyboard(
             '¿Con qué profesional te querés atender?',
-            PROFESIONALES.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+            profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
           );
         }
 
@@ -997,29 +1103,32 @@ export async function POST(request: NextRequest) {
         console.log('Estado de conversación:', estado);
 
         if (estado.paso === 'profesional') {
+          const profesionales = await getProfesionales();
           let profSeleccionado = null;
           const num = parseInt(text);
-          if (!isNaN(num) && num >= 1 && num <= PROFESIONALES.length) {
-            profSeleccionado = PROFESIONALES[num - 1];
+          if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
+            profSeleccionado = profesionales[num - 1];
           } else {
-            profSeleccionado = PROFESIONALES.find(p => p.toLowerCase().includes(text.toLowerCase()));
+            profSeleccionado = profesionales.find(p => p.toLowerCase().includes(text.toLowerCase()));
           }
           if (profSeleccionado) {
+            const servicios = await getServiciosList();
             await saveState({ paso: 'servicio', profesional: profSeleccionado });
             await sendWithKeyboard(
               `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
-              SERVICIOS.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
+              servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
             );
           } else {
-            await sendWithKeyboard('Elegí un profesional válido:', PROFESIONALES.map(p => [{ text: p, callback_data: `profesional:${p}` }]));
+            await sendWithKeyboard('Elegí un profesional válido:', profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }]));
           }
         } else if (estado.paso === 'servicio') {
+          const servicios = await getServiciosList();
           let servicioSeleccionado = null;
           const num = parseInt(text);
-          if (!isNaN(num) && num >= 1 && num <= SERVICIOS.length) {
-            servicioSeleccionado = SERVICIOS[num - 1].nombre;
+          if (!isNaN(num) && num >= 1 && num <= servicios.length) {
+            servicioSeleccionado = servicios[num - 1].nombre;
           } else {
-            servicioSeleccionado = SERVICIOS.find(s => s.nombre.toLowerCase().includes(text.toLowerCase()))?.nombre;
+            servicioSeleccionado = servicios.find(s => s.nombre.toLowerCase().includes(text.toLowerCase()))?.nombre;
           }
 
           if (servicioSeleccionado) {
@@ -1028,26 +1137,31 @@ export async function POST(request: NextRequest) {
           } else {
             await sendWithKeyboard(
               'No reconozco ese servicio. Por favor elegí uno:',
-              SERVICIOS.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
+              servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
             );
           }
 
         } else if (estado.paso === 'nombre') {
           await saveState({ ...estado, paso: 'fecha', nombre: text });
-          const view = buildFechasView(estado.servicio, estado.profesional);
+          const view = await buildFechasView(estado.servicio, estado.profesional);
           await sendWithKeyboard(`Hola *${text}* 👋\n\n${view.text}`, view.keyboard);
 
         } else if (estado.paso === 'fecha') {
           const fechaParseada = parseFecha(text);
-          if (fechaParseada && esDiaLaborable(fechaParseada, estado.profesional)) {
+          let esDiaValido = false;
+          if (fechaParseada) {
+            esDiaValido = await esDiaLaborable(fechaParseada, estado.profesional);
+          }
+          if (fechaParseada && esDiaValido) {
             await showHorarios(fechaParseada, estado.servicio!, estado.profesional!);
-          } else if (fechaParseada && !esDiaLaborable(fechaParseada, estado.profesional)) {
+          } else if (fechaParseada && !esDiaValido) {
+            const keyboard = await buildFechasKeyboard(estado.profesional);
             await sendWithKeyboard(
               '❌ El profesional no atiende ese día. Elegí otro:',
-              buildFechasKeyboard(estado.profesional)
+              keyboard
             );
           } else {
-            const view = buildFechasView(estado.servicio, estado.profesional);
+            const view = await buildFechasView(estado.servicio, estado.profesional);
             await sendWithKeyboard('Elegí un día de la lista:', view.keyboard);
           }
 
@@ -1070,7 +1184,7 @@ export async function POST(request: NextRequest) {
             if (disponibilidad.disponible) {
               // Pasar a confirmación
               await saveState({ ...estado, paso: 'confirmar', hora: horaSeleccionada });
-              const view = buildConfirmacionView({ ...estado, hora: horaSeleccionada });
+              const view = await buildConfirmacionView({ ...estado, hora: horaSeleccionada });
               await sendWithKeyboard(view.text, view.keyboard);
             } else {
               const viewActualizada = await buildHorariosView(estado.fecha!, estado.servicio!, estado.profesional!);
@@ -1085,7 +1199,7 @@ export async function POST(request: NextRequest) {
 
         } else if (estado.paso === 'confirmar') {
           // El usuario escribió algo durante la confirmación → recordarle que use los botones
-          const view = buildConfirmacionView(estado);
+          const view = await buildConfirmacionView(estado);
           await sendWithKeyboard('Por favor usá los botones para confirmar o cancelar:\n\n' + view.text, view.keyboard);
         }
 
