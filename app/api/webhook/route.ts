@@ -173,7 +173,7 @@ function proximosDiasLaborables(cantidad: number, profesional?: string): { fecha
   while (dias.length < cantidad && offset < 30) {
     const candidate = addDays(today, offset);
     const day = candidate.getDay();
-    const works = profesional ? (getHorarioProfesional(profesional, day) !== null) : (day >= 1 && day <= 6);
+    const works = profesional ? (getHorarioProfesional(profesional, day).length > 0) : (day >= 1 && day <= 6);
     
     if (works) {
       let label: string;
