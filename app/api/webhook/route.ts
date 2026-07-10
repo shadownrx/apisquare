@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 import { createClient } from '@vercel/kv';
 import { getLocalReservations, addLocalReservation } from '../admin/reservations/route';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 interface ConversationState {
   paso?: string | null;
@@ -611,6 +612,105 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
   return count >= MAX_RESERVACIONES_POR_USUARIO;
 }
 
+// Gemini Integration
+interface GeminiIntent {
+  action: 'menu' | 'reservar' | 'misreservas' | 'servicios' | 'profesionales' | 'unknown';
+  parameters?: {
+    profesional?: string;
+    servicio?: string;
+    fecha?: string;
+    nombre?: string;
+  };
+}
+
+async function getGeminiResponse(userMessage: string, estado: ConversationState): Promise<{
+  responseText: string;
+  intent: GeminiIntent;
+  shouldContinueWithFlow: boolean;
+}> {
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_API_KEY) {
+    return {
+      responseText: "Lo siento, no puedo procesar tu mensaje en este momento. Por favor usá los botones.",
+      intent: { action: 'unknown' },
+      shouldContinueWithFlow: false
+    };
+  }
+
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+  const config = await getConfig();
+  const serviciosList = config.servicios.map(s => s.nombre).join(', ');
+  const profesionalesList = Object.keys(config.profesionales).join(', ');
+
+  const systemPrompt = `
+Eres un asistente amigable para reservar turnos en una clínica de quiropraxia y masajes.
+Tu trabajo es entender el mensaje del usuario y responder apropiadamente, y también identificar la intención del usuario.
+
+Contexto de la clínica:
+- Profesionales disponibles: ${profesionalesList}
+- Servicios disponibles: ${serviciosList}
+- Atención particular, no se recibe obra social.
+
+Responde en español, de forma concisa y amigable.
+
+Formato de respuesta JSON (escribe solo el JSON, sin texto adicional):
+{
+  "responseText": "tu respuesta al usuario",
+  "intent": {
+    "action": "menu" | "reservar" | "misreservas" | "servicios" | "profesionales" | "unknown",
+    "parameters": {
+      "profesional": "nombre del profesional si el usuario lo mencionó",
+      "servicio": "nombre del servicio si el usuario lo mencionó",
+      "fecha": "fecha en formato YYYY-MM-DD si el usuario lo mencionó, o null",
+      "nombre": "nombre del usuario si lo mencionó"
+    }
+  },
+  "shouldContinueWithFlow": true/false (true si el usuario está en un flujo de reserva y debemos continuar, false si debemos responder con el texto)
+}
+`;
+
+  const chatHistory = estado ? `
+Estado de la conversación:
+- Paso actual: ${estado.paso}
+- Profesional: ${estado.profesional}
+- Servicio: ${estado.servicio}
+- Nombre: ${estado.nombre}
+- Fecha: ${estado.fecha}
+- Hora: ${estado.hora}
+` : '';
+
+  const prompt = `${systemPrompt}\n\n${chatHistory}\n\nMensaje del usuario: ${userMessage}`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    const response = result.response;
+    const text = response.text();
+    
+    // Clean the response (remove markdown code blocks if present)
+    const cleanedText = text.replace(/```json|```/g, '').trim();
+    
+    try {
+      const parsed = JSON.parse(cleanedText);
+      return parsed;
+    } catch (jsonError) {
+      return {
+        responseText: text,
+        intent: { action: 'unknown' },
+        shouldContinueWithFlow: false
+      };
+    }
+  } catch (error) {
+    console.error('Error with Gemini:', error);
+    return {
+      responseText: "Lo siento, no puedo procesar tu mensaje en este momento. Por favor usá los botones.",
+      intent: { action: 'unknown' },
+      shouldContinueWithFlow: false
+    };
+  }
+}
+
 export async function POST(request: NextRequest) {
   console.log('=== NUEVA SOLICITUD ===');
 
@@ -1015,80 +1115,147 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      const normalizedText = text.toLowerCase().trim();
-
-      if (['/start', 'start', 'hola', 'hello', 'buenos días', 'buenas tardes', 'buenas noches', 'hey'].includes(normalizedText)) {
-        // Limpiar estado completamente → usuario nuevo comienza desde cero
-        await clearState();
-        await showMainMenu();
-
-      } else if (['/servicios', 'servicios', 'servicio', '/categorias', 'categorias', 'categoria', 'que servicios hay'].includes(normalizedText)) {
-        await showServices();
-
-      } else if (['/misreservas', 'mis reservas', 'misreservas', 'reservas', 'ver reservas', 'ver mis reservas'].includes(normalizedText)) {
-        let reservasArray: Reservation[] = [];
-
-        if (kv) {
-          const userReservasKey = `user:${chatId}:reservas`;
-          const userReservas = await kv.get(userReservasKey) || [];
-          let rawArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
-          
-          // Self-healing: verificar que las reservas realmente existan
-          const validReservations = [];
-          let changed = false;
-          for (const r of rawArray) {
-            const exists = await kv.get(`reserva:id:${r.id}`);
-            if (exists) {
-              validReservations.push(r);
-            } else {
-              changed = true;
-            }
-          }
-          
-          if (changed) {
-            await kv.set(userReservasKey, JSON.stringify(validReservations));
-          }
-          reservasArray = validReservations;
-        } else {
-          const localReservations = getLocalReservations();
-          reservasArray = localReservations.filter(r => r.chatId === chatId);
-        }
-
-        if (reservasArray.length === 0) {
-          await sendWithKeyboard(
-            'Todavía no tenés reservas. ¿Querés hacer una?',
-            [
-              [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
-              [{ text: '🏠 Menú', callback_data: 'menu' }]
-            ]
-          );
-        } else {
-          const keyboard = reservasArray.map((r: Reservation) => [
-            { text: `${r.servicio} — ${formatDate(r.fecha)} ${r.hora}`, callback_data: 'noop' },
-            { text: '❌ Eliminar', callback_data: `eliminar:${r.id}` }
-          ]);
-          keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
-          await sendWithKeyboard('📋 *Tus reservas:*', keyboard);
-        }
-
-      } else if (['/reservar', 'reservar', 'reservar turno', 'quiero reservar', 'agendar', 'quiero agendar', 'hacer una reserva'].includes(normalizedText)) {
-        const limitReached = await checkReservationLimit(chatId);
-        if (limitReached) {
-          await sendWithKeyboard(
-            '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos permitidos. Para reservar uno nuevo, primero tenés que cancelar alguno desde tus reservas.',
-            [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
-          );
-        } else {
+      // Try Gemini first
+      const geminiResult = await getGeminiResponse(text, estado);
+      
+      // If we have an intent, handle it
+      if (geminiResult.intent.action !== 'unknown' && !geminiResult.shouldContinueWithFlow) {
+        if (geminiResult.intent.action === 'menu') {
+          await clearState();
+          await showMainMenu();
+        } else if (geminiResult.intent.action === 'servicios') {
+          await showServices();
+        } else if (geminiResult.intent.action === 'profesionales') {
           const profesionales = await getProfesionales();
-          await saveState({ paso: 'profesional' });
           await sendWithKeyboard(
-            '¿Con qué profesional te querés atender?',
+            '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
             profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
           );
-        }
+        } else if (geminiResult.intent.action === 'misreservas') {
+          let reservasArray: Reservation[] = [];
 
-      } else if (estado && estado.paso) {
-        console.log('Estado de conversación:', estado);
+          if (kv) {
+            const userReservasKey = `user:${chatId}:reservas`;
+            const userReservas = await kv.get(userReservasKey) || [];
+            let rawArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+            
+            const validReservations = [];
+            let changed = false;
+            for (const r of rawArray) {
+              const exists = await kv.get(`reserva:id:${r.id}`);
+              if (exists) {
+                validReservations.push(r);
+              } else {
+                changed = true;
+              }
+            }
+            
+            if (changed) {
+              await kv.set(userReservasKey, JSON.stringify(validReservations));
+            }
+            reservasArray = validReservations;
+          } else {
+            const localReservations = getLocalReservations();
+            reservasArray = localReservations.filter(r => r.chatId === chatId);
+          }
+
+          if (reservasArray.length === 0) {
+            await sendWithKeyboard(
+              'Todavía no tenés reservas. ¿Querés hacer una?',
+              [
+                [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
+                [{ text: '🏠 Menú', callback_data: 'menu' }]
+              ]
+            );
+          } else {
+            const keyboard = reservasArray.map((r: Reservation) => [
+              { text: `${r.servicio} — ${formatDate(r.fecha)} ${r.hora}`, callback_data: 'noop' },
+              { text: '❌ Eliminar', callback_data: `eliminar:${r.id}` }
+            ]);
+            keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
+            await sendWithKeyboard('📋 *Tus reservas:*', keyboard);
+          }
+        } else if (geminiResult.intent.action === 'reservar') {
+          const limitReached = await checkReservationLimit(chatId);
+          if (limitReached) {
+            await sendWithKeyboard(
+              '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos permitidos. Para reservar uno nuevo, primero tenés que cancelar alguno desde tus reservas.',
+              [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+            );
+          } else {
+            const profesionales = await getProfesionales();
+            
+            // Check if intent has parameters
+            let newEstado: ConversationState = { paso: 'profesional' };
+            
+            if (geminiResult.intent.parameters?.profesional) {
+              // Find the professional
+              const prof = profesionales.find(p => 
+                p.toLowerCase().includes(geminiResult.intent.parameters!.profesional!.toLowerCase())
+              );
+              if (prof) {
+                newEstado.profesional = prof;
+                newEstado.paso = 'servicio';
+              }
+            }
+            
+            if (geminiResult.intent.parameters?.servicio) {
+              const servicios = await getServiciosList();
+              const serv = servicios.find(s => 
+                s.nombre.toLowerCase().includes(geminiResult.intent.parameters!.servicio!.toLowerCase())
+              );
+              if (serv) {
+                newEstado.servicio = serv.nombre;
+                if (newEstado.paso === 'servicio') {
+                  newEstado.paso = 'nombre';
+                }
+              }
+            }
+            
+            if (geminiResult.intent.parameters?.nombre) {
+              newEstado.nombre = geminiResult.intent.parameters.nombre;
+              if (newEstado.paso === 'nombre') {
+                newEstado.paso = 'fecha';
+              }
+            }
+            
+            if (geminiResult.intent.parameters?.fecha) {
+              newEstado.fecha = geminiResult.intent.parameters.fecha;
+              if (newEstado.paso === 'fecha' && newEstado.profesional && newEstado.servicio) {
+                newEstado.paso = 'hora';
+              }
+            }
+            
+            await saveState(newEstado);
+            
+            // Now show the appropriate view
+            if (newEstado.paso === 'profesional') {
+              await sendWithKeyboard(
+                '¿Con qué profesional te querés atender?',
+                profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+              );
+            } else if (newEstado.paso === 'servicio') {
+              const servicios = await getServiciosList();
+              await sendWithKeyboard(
+                `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`,
+                servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
+              );
+            } else if (newEstado.paso === 'nombre') {
+              await sendWithKeyboard(`*${newEstado.servicio}* ✔️\n\n¿Cuál es tu nombre?`);
+            } else if (newEstado.paso === 'fecha') {
+              const view = await buildFechasView(newEstado.servicio, newEstado.profesional);
+              await sendWithKeyboard(`Hola *${newEstado.nombre}* 👋\n\n${view.text}`, view.keyboard);
+            } else if (newEstado.paso === 'hora') {
+              const view = await buildHorariosView(newEstado.fecha!, newEstado.servicio!, newEstado.profesional!);
+              await sendWithKeyboard(view.text, view.keyboard);
+            }
+          }
+        } else {
+          await sendWithKeyboard(geminiResult.responseText);
+        }
+      } else if (geminiResult.shouldContinueWithFlow && estado && estado.paso) {
+        // Continue with the existing flow
+        console.log('Continuing with existing flow, estado:', estado);
 
         if (estado.paso === 'profesional') {
           const profesionales = await getProfesionales();
@@ -1190,9 +1357,13 @@ export async function POST(request: NextRequest) {
           const view = await buildConfirmacionView(estado);
           await sendWithKeyboard('Por favor usá los botones para confirmar o cancelar:\n\n' + view.text, view.keyboard);
         }
-
       } else {
-        await showMainMenu();
+        // Fallback to original flow or show Gemini response
+        if (geminiResult.responseText) {
+          await sendWithKeyboard(geminiResult.responseText);
+        } else {
+          await showMainMenu();
+        }
       }
     }
 

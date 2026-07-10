@@ -3,3 +3,9 @@
 node_modules
 .next/*
 .vercel/*
+
+
+#variable entorno
+.env.local
+.env.example
+.env
