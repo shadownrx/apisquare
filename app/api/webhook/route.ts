@@ -2,6 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 import { createClient } from '@vercel/kv';
 import { getLocalReservations, addLocalReservation } from '../admin/reservations/route';
+import {
+  BotIntent,
+  isValidFlowInput,
+  matchesLoosely,
+  parseInfoQuery,
+  parseLocalIntent,
+} from '@/lib/bot-intent';
+import { addDays, getToday, parseFecha, toDateStr } from '@/lib/parse-fecha';
 
 interface ConversationState {
   paso?: string | null;
@@ -216,24 +224,6 @@ function formatDate(fechaStr: string): string {
   return fecha.toLocaleDateString('es-ES', options);
 }
 
-function toDateStr(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
-function getToday(): Date {
-  const now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-}
-
-function addDays(date: Date, days: number): Date {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
-}
-
 async function proximosDiasLaborables(cantidad: number, profesional?: string): Promise<{ fecha: string; label: string }[]> {
   const dias: { fecha: string; label: string }[] = [];
   const today = getToday();
@@ -299,30 +289,6 @@ async function buildFechasView(servicio?: string, profesional?: string) {
     keyboard: await buildFechasKeyboard(profesional)
   };
 }
-
-function parseFecha(text: string): string | null {
-  const normalized = text.toLowerCase().trim();
-  const today = getToday();
-
-  if (['hoy', 'today'].includes(normalized)) return toDateStr(today);
-  if (['mañana', 'manana', 'tomorrow'].includes(normalized)) return toDateStr(addDays(today, 1));
-  if (['pasado mañana', 'pasado manana'].includes(normalized)) return toDateStr(addDays(today, 2));
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return normalized;
-
-  const slashMatch = normalized.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
-  if (slashMatch) {
-    const day = parseInt(slashMatch[1], 10);
-    const month = parseInt(slashMatch[2], 10);
-    const year = slashMatch[3] ? parseInt(slashMatch[3], 10) : today.getFullYear();
-    const d = new Date(year, month - 1, day);
-    if (!isNaN(d.getTime())) return toDateStr(d);
-  }
-
-  return null;
-}
-
-// Eliminado esDiaLaborable antiguo
 
 // Función para generar ID único
 function generateId(): string {
@@ -612,16 +578,6 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
 }
 
 // Groq Integration
-interface BotIntent {
-  action: 'menu' | 'reservar' | 'misreservas' | 'servicios' | 'profesionales' | 'consulta' | 'unknown';
-  parameters?: {
-    profesional?: string;
-    servicio?: string;
-    fecha?: string;
-    nombre?: string;
-  };
-}
-
 interface AIResponse {
   responseText: string;
   intent: BotIntent;
@@ -634,141 +590,6 @@ const ASSIST_KEYBOARD = [
 ];
 
 const DAY_NAMES = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
-
-function normalizeHumanText(text: string): string {
-  return text
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\p{L}\p{N}\s:?]/gu, ' ')
-    .replace(/(.)\1{2,}/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function matchesLoosely(text: string, target: string): boolean {
-  const normalizedText = normalizeHumanText(text);
-  const normalizedTarget = normalizeHumanText(target);
-  return normalizedText.includes(normalizedTarget) || normalizedTarget.includes(normalizedText);
-}
-
-function containsBookingIntent(text: string): boolean {
-  const normalized = normalizeHumanText(text);
-  const bookingSignals = [
-    'reservar',
-    'reserva',
-    'turno',
-    'turnito',
-    'cita',
-    'agendar',
-    'agenda',
-    'sacar turno',
-    'pedir turno',
-    'quiero turno',
-    'necesito turno',
-    'un turno',
-    'hay turno',
-    'dame turno',
-    'me anotas',
-    'me agend',
-  ];
-
-  if (bookingSignals.some(signal => normalized.includes(signal))) {
-    return true;
-  }
-
-  return /\b(quiero|qiero|kiero|necesito|busco|pido|dame|podes)\b/.test(normalized) &&
-    /\b(turno|turnito|cita|reserva)\b/.test(normalized);
-}
-
-function looksLikeQuestion(text: string): boolean {
-  if (containsBookingIntent(text)) return false;
-
-  const normalized = normalizeHumanText(text);
-  const questionSignals = [
-    '?',
-    'queria saber',
-    'quiero saber',
-    'quisiera saber',
-    'me podes',
-    'me podés',
-    'podes decir',
-    'podés decir',
-    'reciben',
-    'aceptan',
-    'obra social',
-    'prepaga',
-    'horario',
-    'cuanto',
-    'precio',
-    'cuesta',
-    'donde',
-    'ubicacion',
-    'informacion',
-    'consulta',
-  ];
-  return questionSignals.some(signal => normalized.includes(normalizeHumanText(signal)));
-}
-
-function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'precios' | null {
-  const normalized = normalizeHumanText(text);
-
-  if (
-    normalized.includes('obra social') ||
-    normalized.includes('prepaga') ||
-    normalized.includes('osde') ||
-    normalized.includes('swiss medical') ||
-    normalized.includes('galeno') ||
-    normalized.includes('medicus')
-  ) {
-    return 'obra_social';
-  }
-
-  if (
-    normalized.includes('horario') ||
-    normalized.includes('atienden') ||
-    normalized.includes('abren') ||
-    normalized.includes('cierran') ||
-    normalized.includes('cuando atiende')
-  ) {
-    return 'horarios';
-  }
-
-  if (
-    normalized.includes('precio') ||
-    normalized.includes('cuesta') ||
-    normalized.includes('cuanto sale') ||
-    normalized.includes('valor') ||
-    normalized.includes('costo') ||
-    normalized.includes('tarifa')
-  ) {
-    return 'precios';
-  }
-
-  return null;
-}
-
-function isValidFlowInput(text: string, paso: string): boolean {
-  if (looksLikeQuestion(text)) return false;
-
-  const trimmed = text.trim();
-
-  switch (paso) {
-    case 'nombre':
-      return trimmed.length >= 2 && trimmed.length <= 40 && trimmed.split(/\s+/).length <= 4;
-    case 'fecha':
-      return parseFecha(text) !== null;
-    case 'hora':
-      return /^\d{1,2}(:\d{2})?$/.test(trimmed);
-    case 'profesional':
-    case 'servicio':
-      return trimmed.length > 0;
-    case 'confirmar':
-      return false;
-    default:
-      return false;
-  }
-}
 
 async function buildHorariosInfoMessage(): Promise<string> {
   const config = await getConfig();
@@ -801,57 +622,6 @@ async function buildPreciosInfoMessage(): Promise<string> {
 
   message += '\n¿Te gustaría reservar alguno?';
   return message;
-}
-
-function parseLocalIntent(text: string): BotIntent | null {
-  const normalized = normalizeHumanText(text);
-
-  if (parseInfoQuery(text)) {
-    return { action: 'consulta' };
-  }
-
-  if (looksLikeQuestion(text)) {
-    return { action: 'consulta' };
-  }
-
-  if (
-    normalized === '/start' ||
-    normalized === 'start' ||
-    normalized === 'menu' ||
-    normalized.includes('boton') ||
-    normalized.includes('ayuda') ||
-    normalized.includes('inicio')
-  ) {
-    return { action: 'menu' };
-  }
-
-  if (
-    normalized === 'hola' ||
-    normalized === 'buenas' ||
-    normalized === 'buen dia' ||
-    normalized.startsWith('hola ') ||
-    normalized.startsWith('buenas ')
-  ) {
-    return { action: 'menu' };
-  }
-
-  if (containsBookingIntent(text)) {
-    return { action: 'reservar' };
-  }
-
-  if (normalized.includes('mis reservas') || normalized === 'reservas') {
-    return { action: 'misreservas' };
-  }
-
-  if (normalized.includes('servicio')) {
-    return { action: 'servicios' };
-  }
-
-  if (normalized.includes('profesional')) {
-    return { action: 'profesionales' };
-  }
-
-  return null;
 }
 
 async function getGroqResponse(userMessage: string, estado: ConversationState): Promise<AIResponse> {
