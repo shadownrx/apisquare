@@ -624,6 +624,30 @@ async function buildPreciosInfoMessage(): Promise<string> {
   return message;
 }
 
+async function buildClinicContextForAI(): Promise<string> {
+  const config = await getConfig();
+  let context = 'Datos actualizados de la clínica (usá solo esta información, no inventes):\n\n';
+
+  context += 'Servicios y precios:\n';
+  for (const servicio of config.servicios) {
+    context += `- ${servicio.nombre}: $${servicio.precio.toLocaleString('es-AR')} (${servicio.duracionMinutos} min)\n`;
+  }
+
+  context += '\nProfesionales y horarios:\n';
+  for (const [profesional, schedule] of Object.entries(config.profesionales)) {
+    context += `${profesional}:\n`;
+    const days = Object.keys(schedule).map(Number).sort((a, b) => a - b);
+    for (const day of days) {
+      const slots = schedule[day];
+      const slotText = slots.map(slot => `${slot.inicio} a ${slot.fin}`).join(' y ');
+      context += `  - ${DAY_NAMES[day]}: ${slotText}\n`;
+    }
+  }
+
+  context += '\nAtención particular. NO se recibe obra social.\n';
+  return context;
+}
+
 async function getGroqResponse(userMessage: string, estado: ConversationState): Promise<AIResponse> {
   const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
   if (!GROQ_API_KEY) {
@@ -634,34 +658,32 @@ async function getGroqResponse(userMessage: string, estado: ConversationState): 
     };
   }
 
-  const config = await getConfig();
-  const serviciosList = config.servicios.map(s => s.nombre).join(', ');
-  const profesionalesList = Object.keys(config.profesionales).join(', ');
+  const clinicContext = await buildClinicContextForAI();
 
-  const systemPrompt = `Sos el asistente virtual de una clínica de quiropraxia y masajes. Tu tono es profesional, claro y amable.
+  const systemPrompt = `Sos el asistente virtual con IA de una clínica de quiropraxia y masajes en 2026.
+Tu trabajo principal es ENTENDER y RESPONDER en lenguaje natural, como una recepcionista real.
 
-Contexto de la clínica:
-- Profesionales disponibles: ${profesionalesList}
-- Servicios disponibles: ${serviciosList}
-- Atención particular. NO se recibe obra social.
+${clinicContext}
 
-Reglas importantes:
-1. Entendé lenguaje humano informal: errores de tipeo, letras repetidas ("quierooo turnooo"), abreviaciones, modismos rioplatenses y mensajes poco formales.
-2. Si el usuario hace una consulta (obra social, horarios, precios, información general), respondé la consulta directamente. NO inicies ni continúes una reserva.
-3. Solo usá shouldContinueWithFlow=true si el usuario está claramente respondiendo el paso actual del flujo de reserva.
-4. Si hay un flujo de reserva activo pero el usuario hace una pregunta distinta, respondé la pregunta y NO continúes el flujo.
-5. Sé breve, profesional y útil. Usá español rioplatense moderado.
+Comportamiento:
+1. Siempre escribí responseText con una respuesta natural, cálida y profesional para el usuario.
+2. Entendé lenguaje humano informal: errores, letras repetidas ("quierooo turnooo"), abreviaciones y modismos rioplatenses.
+3. Respondé consultas directamente en responseText usando los datos de la clínica.
+4. Usá intent.action solo para indicar qué acción del sistema debe ejecutarse después de tu respuesta.
+5. NO inicies reserva si el usuario solo pregunta algo. En ese caso usá action "consulta".
+6. Usá shouldContinueWithFlow=true solo si el usuario responde claramente el paso actual del flujo.
+7. Sé breve pero humano. Podés usar emojis con moderación.
 
-Respondé únicamente con un JSON válido con este formato:
+Respondé únicamente con un JSON válido:
 {
-  "responseText": "tu respuesta al usuario",
+  "responseText": "tu respuesta conversacional al usuario",
   "intent": {
     "action": "menu" | "reservar" | "misreservas" | "servicios" | "profesionales" | "consulta" | "unknown",
     "parameters": {
-      "profesional": "nombre del profesional si el usuario lo mencionó",
-      "servicio": "nombre del servicio si el usuario lo mencionó",
-      "fecha": "fecha en formato YYYY-MM-DD si el usuario lo mencionó, o null",
-      "nombre": "nombre del usuario si lo mencionó"
+      "profesional": "nombre si lo mencionó o null",
+      "servicio": "nombre si lo mencionó o null",
+      "fecha": "YYYY-MM-DD si lo mencionó o null",
+      "nombre": "nombre del usuario si lo mencionó o null"
     }
   },
   "shouldContinueWithFlow": true o false
@@ -686,7 +708,7 @@ Estado de la conversación:
           { role: 'system', content: systemPrompt },
           { role: 'user', content: `${chatHistory}\nMensaje del usuario: ${userMessage}`.trim() }
         ],
-        temperature: 0.2,
+        temperature: 0.4,
         response_format: { type: 'json_object' }
       },
       {
@@ -718,6 +740,26 @@ Estado de la conversación:
       shouldContinueWithFlow: false
     };
   }
+}
+
+async function resolveTextIntent(
+  text: string,
+  estado: ConversationState
+): Promise<AIResponse> {
+  const aiResult = await getGroqResponse(text, estado);
+  const hasAIResponse = Boolean(aiResult.responseText?.trim());
+  const hasKnownIntent = aiResult.intent.action !== 'unknown';
+
+  if (hasKnownIntent || hasAIResponse) {
+    return aiResult;
+  }
+
+  const localIntent = parseLocalIntent(text);
+  if (localIntent) {
+    return { responseText: '', intent: localIntent, shouldContinueWithFlow: false };
+  }
+
+  return aiResult;
 }
 
 export async function POST(request: NextRequest) {
@@ -1103,15 +1145,18 @@ export async function POST(request: NextRequest) {
         }
       };
 
-      const showMainMenu = async () => {
+      const MAIN_MENU_KEYBOARD = [
+        [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
+        [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
+        [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
+        [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
+      ];
+
+      const showMainMenu = async (intro?: string) => {
         await sendWithKeyboard(
-          '¡Hola! 👋 Soy el asistente de la clínica.\n\n¿En qué puedo ayudarte hoy?\n*(Atención particular, sin obra social)*',
-          [
-            [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
-            [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
-            [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
-            [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
-          ]
+          intro ||
+            '¡Hola! 👋 Soy el asistente de la clínica.\n\n¿En qué puedo ayudarte hoy?\n*(Atención particular, sin obra social)*',
+          MAIN_MENU_KEYBOARD
         );
       };
 
@@ -1128,13 +1173,6 @@ export async function POST(request: NextRequest) {
         }
       };
 
-      const showServices = async () => {
-        const servicios = await getServiciosList();
-        await sendWithKeyboard(
-          '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*',
-          servicios.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
-        );
-      };
 
       const showHorarios = async (fechaStr: string, servicio: string, profesional: string) => {
         await saveState({ ...estado, paso: 'hora', servicio, nombre: estado.nombre, fecha: fechaStr, profesional });
@@ -1142,41 +1180,39 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      const infoQuery = parseInfoQuery(text);
-      if (infoQuery) {
-        await clearState();
-        await showInfoResponse(infoQuery);
-        return NextResponse.json({ status: 'ok' });
-      }
-
-      const localIntent = parseLocalIntent(text);
-      const aiResult = localIntent
-        ? { responseText: '', intent: localIntent, shouldContinueWithFlow: false }
-        : await getGroqResponse(text, estado);
+      let aiResult = await resolveTextIntent(text, estado);
 
       if (aiResult.intent.action === 'consulta') {
         await clearState();
-        const consultaInfo = parseInfoQuery(text);
-        if (consultaInfo) {
-          await showInfoResponse(consultaInfo);
-        } else if (aiResult.responseText) {
+        if (aiResult.responseText?.trim()) {
           await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
         } else {
-          await sendWithKeyboard(
-            'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
-            ASSIST_KEYBOARD
-          );
+          const consultaInfo = parseInfoQuery(text);
+          if (consultaInfo) {
+            await showInfoResponse(consultaInfo);
+          } else {
+            await sendWithKeyboard(
+              'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
+              ASSIST_KEYBOARD
+            );
+          }
         }
       } else if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
         if (aiResult.intent.action === 'menu') {
           await clearState();
-          await showMainMenu();
+          await showMainMenu(aiResult.responseText?.trim());
         } else if (aiResult.intent.action === 'servicios') {
-          await showServices();
+          const servicios = await getServiciosList();
+          await sendWithKeyboard(
+            aiResult.responseText?.trim() ||
+              '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*',
+            servicios.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
+          );
         } else if (aiResult.intent.action === 'profesionales') {
           const profesionales = await getProfesionales();
           await sendWithKeyboard(
-            '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
+            aiResult.responseText?.trim() ||
+              '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
             profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
           );
         } else if (aiResult.intent.action === 'misreservas') {
@@ -1279,7 +1315,7 @@ export async function POST(request: NextRequest) {
             // Now show the appropriate view
             if (newEstado.paso === 'profesional') {
               await sendWithKeyboard(
-                '¿Con qué profesional te querés atender?',
+                aiResult.responseText?.trim() || '¿Con qué profesional te querés atender?',
                 profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
               );
             } else if (newEstado.paso === 'servicio') {
@@ -1404,7 +1440,7 @@ export async function POST(request: NextRequest) {
           const view = await buildConfirmacionView(estado);
           await sendWithKeyboard('Por favor usá los botones para confirmar o cancelar:\n\n' + view.text, view.keyboard);
         }
-      } else if (aiResult.responseText) {
+      } else if (aiResult.responseText?.trim()) {
         await clearState();
         await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
       } else if (estado?.paso) {
