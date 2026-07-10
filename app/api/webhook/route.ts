@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 import { createClient } from '@vercel/kv';
 import { getLocalReservations, addLocalReservation } from '../admin/reservations/route';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 
 interface ConversationState {
   paso?: string | null;
@@ -612,8 +611,8 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
   return count >= MAX_RESERVACIONES_POR_USUARIO;
 }
 
-// Gemini Integration
-interface GeminiIntent {
+// Groq Integration
+interface BotIntent {
   action: 'menu' | 'reservar' | 'misreservas' | 'servicios' | 'profesionales' | 'unknown';
   parameters?: {
     profesional?: string;
@@ -623,29 +622,62 @@ interface GeminiIntent {
   };
 }
 
-async function getGeminiResponse(userMessage: string, estado: ConversationState): Promise<{
+interface AIResponse {
   responseText: string;
-  intent: GeminiIntent;
+  intent: BotIntent;
   shouldContinueWithFlow: boolean;
-}> {
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-  if (!GEMINI_API_KEY) {
+}
+
+function parseLocalIntent(text: string): BotIntent | null {
+  const normalized = text.toLowerCase().trim();
+
+  if (
+    normalized === '/start' ||
+    normalized === 'start' ||
+    normalized === 'hola' ||
+    normalized === 'menu' ||
+    normalized === 'menú' ||
+    normalized.includes('boton') ||
+    normalized.includes('ayuda') ||
+    normalized.includes('inicio')
+  ) {
+    return { action: 'menu' };
+  }
+
+  if (normalized.includes('reservar') || normalized.includes('turno') || normalized.includes('cita')) {
+    return { action: 'reservar' };
+  }
+
+  if (normalized.includes('mis reservas') || normalized === 'reservas') {
+    return { action: 'misreservas' };
+  }
+
+  if (normalized.includes('servicio')) {
+    return { action: 'servicios' };
+  }
+
+  if (normalized.includes('profesional')) {
+    return { action: 'profesionales' };
+  }
+
+  return null;
+}
+
+async function getGroqResponse(userMessage: string, estado: ConversationState): Promise<AIResponse> {
+  const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
+  if (!GROQ_API_KEY) {
     return {
-      responseText: "Lo siento, no puedo procesar tu mensaje en este momento. Por favor usá los botones.",
+      responseText: '',
       intent: { action: 'unknown' },
       shouldContinueWithFlow: false
     };
   }
 
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
   const config = await getConfig();
   const serviciosList = config.servicios.map(s => s.nombre).join(', ');
   const profesionalesList = Object.keys(config.profesionales).join(', ');
 
-  const systemPrompt = `
-Eres un asistente amigable para reservar turnos en una clínica de quiropraxia y masajes.
+  const systemPrompt = `Eres un asistente amigable para reservar turnos en una clínica de quiropraxia y masajes.
 Tu trabajo es entender el mensaje del usuario y responder apropiadamente, y también identificar la intención del usuario.
 
 Contexto de la clínica:
@@ -655,7 +687,7 @@ Contexto de la clínica:
 
 Responde en español, de forma concisa y amigable.
 
-Formato de respuesta JSON (escribe solo el JSON, sin texto adicional):
+Respondé únicamente con un JSON válido con este formato:
 {
   "responseText": "tu respuesta al usuario",
   "intent": {
@@ -667,34 +699,46 @@ Formato de respuesta JSON (escribe solo el JSON, sin texto adicional):
       "nombre": "nombre del usuario si lo mencionó"
     }
   },
-  "shouldContinueWithFlow": true/false (true si el usuario está en un flujo de reserva y debemos continuar, false si debemos responder con el texto)
-}
-`;
+  "shouldContinueWithFlow": true o false
+}`;
 
-  const chatHistory = estado ? `
+  const chatHistory = estado?.paso ? `
 Estado de la conversación:
 - Paso actual: ${estado.paso}
-- Profesional: ${estado.profesional}
-- Servicio: ${estado.servicio}
-- Nombre: ${estado.nombre}
-- Fecha: ${estado.fecha}
-- Hora: ${estado.hora}
+- Profesional: ${estado.profesional || 'no elegido'}
+- Servicio: ${estado.servicio || 'no elegido'}
+- Nombre: ${estado.nombre || 'no indicado'}
+- Fecha: ${estado.fecha || 'no elegida'}
+- Hora: ${estado.hora || 'no elegida'}
 ` : '';
 
-  const prompt = `${systemPrompt}\n\n${chatHistory}\n\nMensaje del usuario: ${userMessage}`;
-
   try {
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-    
-    // Clean the response (remove markdown code blocks if present)
+    const { data } = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: process.env.GROQ_MODEL?.trim() || 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `${chatHistory}\nMensaje del usuario: ${userMessage}`.trim() }
+        ],
+        temperature: 0.2,
+        response_format: { type: 'json_object' }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      }
+    );
+
+    const text = data.choices?.[0]?.message?.content || '';
     const cleanedText = text.replace(/```json|```/g, '').trim();
-    
+
     try {
-      const parsed = JSON.parse(cleanedText);
-      return parsed;
-    } catch (jsonError) {
+      return JSON.parse(cleanedText) as AIResponse;
+    } catch {
       return {
         responseText: text,
         intent: { action: 'unknown' },
@@ -702,9 +746,9 @@ Estado de la conversación:
       };
     }
   } catch (error) {
-    console.error('Error with Gemini:', error);
+    console.error('Error with Groq:', error);
     return {
-      responseText: "Lo siento, no puedo procesar tu mensaje en este momento. Por favor usá los botones.",
+      responseText: '',
       intent: { action: 'unknown' },
       shouldContinueWithFlow: false
     };
@@ -1115,23 +1159,24 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      // Try Gemini first
-      const geminiResult = await getGeminiResponse(text, estado);
-      
-      // If we have an intent, handle it
-      if (geminiResult.intent.action !== 'unknown' && !geminiResult.shouldContinueWithFlow) {
-        if (geminiResult.intent.action === 'menu') {
+      const localIntent = parseLocalIntent(text);
+      const aiResult = localIntent
+        ? { responseText: '', intent: localIntent, shouldContinueWithFlow: false }
+        : await getGroqResponse(text, estado);
+
+      if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
+        if (aiResult.intent.action === 'menu') {
           await clearState();
           await showMainMenu();
-        } else if (geminiResult.intent.action === 'servicios') {
+        } else if (aiResult.intent.action === 'servicios') {
           await showServices();
-        } else if (geminiResult.intent.action === 'profesionales') {
+        } else if (aiResult.intent.action === 'profesionales') {
           const profesionales = await getProfesionales();
           await sendWithKeyboard(
             '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
             profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
           );
-        } else if (geminiResult.intent.action === 'misreservas') {
+        } else if (aiResult.intent.action === 'misreservas') {
           let reservasArray: Reservation[] = [];
 
           if (kv) {
@@ -1175,7 +1220,7 @@ export async function POST(request: NextRequest) {
             keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
             await sendWithKeyboard('📋 *Tus reservas:*', keyboard);
           }
-        } else if (geminiResult.intent.action === 'reservar') {
+        } else if (aiResult.intent.action === 'reservar') {
           const limitReached = await checkReservationLimit(chatId);
           if (limitReached) {
             await sendWithKeyboard(
@@ -1188,10 +1233,10 @@ export async function POST(request: NextRequest) {
             // Check if intent has parameters
             let newEstado: ConversationState = { paso: 'profesional' };
             
-            if (geminiResult.intent.parameters?.profesional) {
+            if (aiResult.intent.parameters?.profesional) {
               // Find the professional
               const prof = profesionales.find(p => 
-                p.toLowerCase().includes(geminiResult.intent.parameters!.profesional!.toLowerCase())
+                p.toLowerCase().includes(aiResult.intent.parameters!.profesional!.toLowerCase())
               );
               if (prof) {
                 newEstado.profesional = prof;
@@ -1199,10 +1244,10 @@ export async function POST(request: NextRequest) {
               }
             }
             
-            if (geminiResult.intent.parameters?.servicio) {
+            if (aiResult.intent.parameters?.servicio) {
               const servicios = await getServiciosList();
               const serv = servicios.find(s => 
-                s.nombre.toLowerCase().includes(geminiResult.intent.parameters!.servicio!.toLowerCase())
+                s.nombre.toLowerCase().includes(aiResult.intent.parameters!.servicio!.toLowerCase())
               );
               if (serv) {
                 newEstado.servicio = serv.nombre;
@@ -1212,15 +1257,15 @@ export async function POST(request: NextRequest) {
               }
             }
             
-            if (geminiResult.intent.parameters?.nombre) {
-              newEstado.nombre = geminiResult.intent.parameters.nombre;
+            if (aiResult.intent.parameters?.nombre) {
+              newEstado.nombre = aiResult.intent.parameters.nombre;
               if (newEstado.paso === 'nombre') {
                 newEstado.paso = 'fecha';
               }
             }
             
-            if (geminiResult.intent.parameters?.fecha) {
-              newEstado.fecha = geminiResult.intent.parameters.fecha;
+            if (aiResult.intent.parameters?.fecha) {
+              newEstado.fecha = aiResult.intent.parameters.fecha;
               if (newEstado.paso === 'fecha' && newEstado.profesional && newEstado.servicio) {
                 newEstado.paso = 'hora';
               }
@@ -1251,10 +1296,9 @@ export async function POST(request: NextRequest) {
             }
           }
         } else {
-          await sendWithKeyboard(geminiResult.responseText);
+          await sendWithKeyboard(aiResult.responseText);
         }
-      } else if (geminiResult.shouldContinueWithFlow && estado && estado.paso) {
-        // Continue with the existing flow
+      } else if (estado?.paso) {
         console.log('Continuing with existing flow, estado:', estado);
 
         if (estado.paso === 'profesional') {
@@ -1357,13 +1401,11 @@ export async function POST(request: NextRequest) {
           const view = await buildConfirmacionView(estado);
           await sendWithKeyboard('Por favor usá los botones para confirmar o cancelar:\n\n' + view.text, view.keyboard);
         }
+      } else if (aiResult.responseText) {
+        await sendWithKeyboard(aiResult.responseText);
+        await showMainMenu();
       } else {
-        // Fallback to original flow or show Gemini response
-        if (geminiResult.responseText) {
-          await sendWithKeyboard(geminiResult.responseText);
-        } else {
-          await showMainMenu();
-        }
+        await showMainMenu();
       }
     }
 
