@@ -613,7 +613,7 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
 
 // Groq Integration
 interface BotIntent {
-  action: 'menu' | 'reservar' | 'misreservas' | 'servicios' | 'profesionales' | 'unknown';
+  action: 'menu' | 'reservar' | 'misreservas' | 'servicios' | 'profesionales' | 'consulta' | 'unknown';
   parameters?: {
     profesional?: string;
     servicio?: string;
@@ -628,15 +628,196 @@ interface AIResponse {
   shouldContinueWithFlow: boolean;
 }
 
+const ASSIST_KEYBOARD = [
+  [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
+  [{ text: '📋 Ver servicios', callback_data: 'servicios' }, { text: '🏠 Menú', callback_data: 'menu' }]
+];
+
+const DAY_NAMES = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+
+function normalizeHumanText(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}\s:?]/gu, ' ')
+    .replace(/(.)\1{2,}/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function matchesLoosely(text: string, target: string): boolean {
+  const normalizedText = normalizeHumanText(text);
+  const normalizedTarget = normalizeHumanText(target);
+  return normalizedText.includes(normalizedTarget) || normalizedTarget.includes(normalizedText);
+}
+
+function containsBookingIntent(text: string): boolean {
+  const normalized = normalizeHumanText(text);
+  const bookingSignals = [
+    'reservar',
+    'reserva',
+    'turno',
+    'turnito',
+    'cita',
+    'agendar',
+    'agenda',
+    'sacar turno',
+    'pedir turno',
+    'quiero turno',
+    'necesito turno',
+    'un turno',
+    'hay turno',
+    'dame turno',
+    'me anotas',
+    'me agend',
+  ];
+
+  if (bookingSignals.some(signal => normalized.includes(signal))) {
+    return true;
+  }
+
+  return /\b(quiero|qiero|kiero|necesito|busco|pido|dame|podes)\b/.test(normalized) &&
+    /\b(turno|turnito|cita|reserva)\b/.test(normalized);
+}
+
+function looksLikeQuestion(text: string): boolean {
+  if (containsBookingIntent(text)) return false;
+
+  const normalized = normalizeHumanText(text);
+  const questionSignals = [
+    '?',
+    'queria saber',
+    'quiero saber',
+    'quisiera saber',
+    'me podes',
+    'me podés',
+    'podes decir',
+    'podés decir',
+    'reciben',
+    'aceptan',
+    'obra social',
+    'prepaga',
+    'horario',
+    'cuanto',
+    'precio',
+    'cuesta',
+    'donde',
+    'ubicacion',
+    'informacion',
+    'consulta',
+  ];
+  return questionSignals.some(signal => normalized.includes(normalizeHumanText(signal)));
+}
+
+function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'precios' | null {
+  const normalized = normalizeHumanText(text);
+
+  if (
+    normalized.includes('obra social') ||
+    normalized.includes('prepaga') ||
+    normalized.includes('osde') ||
+    normalized.includes('swiss medical') ||
+    normalized.includes('galeno') ||
+    normalized.includes('medicus')
+  ) {
+    return 'obra_social';
+  }
+
+  if (
+    normalized.includes('horario') ||
+    normalized.includes('atienden') ||
+    normalized.includes('abren') ||
+    normalized.includes('cierran') ||
+    normalized.includes('cuando atiende')
+  ) {
+    return 'horarios';
+  }
+
+  if (
+    normalized.includes('precio') ||
+    normalized.includes('cuesta') ||
+    normalized.includes('cuanto sale') ||
+    normalized.includes('valor') ||
+    normalized.includes('costo') ||
+    normalized.includes('tarifa')
+  ) {
+    return 'precios';
+  }
+
+  return null;
+}
+
+function isValidFlowInput(text: string, paso: string): boolean {
+  if (looksLikeQuestion(text)) return false;
+
+  const trimmed = text.trim();
+
+  switch (paso) {
+    case 'nombre':
+      return trimmed.length >= 2 && trimmed.length <= 40 && trimmed.split(/\s+/).length <= 4;
+    case 'fecha':
+      return parseFecha(text) !== null;
+    case 'hora':
+      return /^\d{1,2}(:\d{2})?$/.test(trimmed);
+    case 'profesional':
+    case 'servicio':
+      return trimmed.length > 0;
+    case 'confirmar':
+      return false;
+    default:
+      return false;
+  }
+}
+
+async function buildHorariosInfoMessage(): Promise<string> {
+  const config = await getConfig();
+  let message = '⏰ *Horarios de atención*\n\n*(Atención particular, sin obra social)*\n\n';
+
+  for (const [profesional, schedule] of Object.entries(config.profesionales)) {
+    message += `👨‍⚕️ *${profesional}*\n`;
+    const days = Object.keys(schedule).map(Number).sort((a, b) => a - b);
+
+    for (const day of days) {
+      const slots = schedule[day];
+      const slotText = slots.map(slot => `${slot.inicio} a ${slot.fin}`).join(' y ');
+      message += `• ${DAY_NAMES[day]}: ${slotText}\n`;
+    }
+
+    message += '\n';
+  }
+
+  message += 'Si querés, puedo ayudarte a reservar un turno disponible.';
+  return message;
+}
+
+async function buildPreciosInfoMessage(): Promise<string> {
+  const servicios = await getServiciosList();
+  let message = '💰 *Servicios y precios*\n\n*(Atención particular, sin obra social)*\n\n';
+
+  for (const servicio of servicios) {
+    message += `• *${servicio.nombre}*: $${servicio.precio.toLocaleString('es-AR')} (${servicio.duracionMinutos} min)\n`;
+  }
+
+  message += '\n¿Te gustaría reservar alguno?';
+  return message;
+}
+
 function parseLocalIntent(text: string): BotIntent | null {
-  const normalized = text.toLowerCase().trim();
+  const normalized = normalizeHumanText(text);
+
+  if (parseInfoQuery(text)) {
+    return { action: 'consulta' };
+  }
+
+  if (looksLikeQuestion(text)) {
+    return { action: 'consulta' };
+  }
 
   if (
     normalized === '/start' ||
     normalized === 'start' ||
-    normalized === 'hola' ||
     normalized === 'menu' ||
-    normalized === 'menú' ||
     normalized.includes('boton') ||
     normalized.includes('ayuda') ||
     normalized.includes('inicio')
@@ -644,7 +825,17 @@ function parseLocalIntent(text: string): BotIntent | null {
     return { action: 'menu' };
   }
 
-  if (normalized.includes('reservar') || normalized.includes('turno') || normalized.includes('cita')) {
+  if (
+    normalized === 'hola' ||
+    normalized === 'buenas' ||
+    normalized === 'buen dia' ||
+    normalized.startsWith('hola ') ||
+    normalized.startsWith('buenas ')
+  ) {
+    return { action: 'menu' };
+  }
+
+  if (containsBookingIntent(text)) {
     return { action: 'reservar' };
   }
 
@@ -677,21 +868,25 @@ async function getGroqResponse(userMessage: string, estado: ConversationState): 
   const serviciosList = config.servicios.map(s => s.nombre).join(', ');
   const profesionalesList = Object.keys(config.profesionales).join(', ');
 
-  const systemPrompt = `Eres un asistente amigable para reservar turnos en una clínica de quiropraxia y masajes.
-Tu trabajo es entender el mensaje del usuario y responder apropiadamente, y también identificar la intención del usuario.
+  const systemPrompt = `Sos el asistente virtual de una clínica de quiropraxia y masajes. Tu tono es profesional, claro y amable.
 
 Contexto de la clínica:
 - Profesionales disponibles: ${profesionalesList}
 - Servicios disponibles: ${serviciosList}
-- Atención particular, no se recibe obra social.
+- Atención particular. NO se recibe obra social.
 
-Responde en español, de forma concisa y amigable.
+Reglas importantes:
+1. Entendé lenguaje humano informal: errores de tipeo, letras repetidas ("quierooo turnooo"), abreviaciones, modismos rioplatenses y mensajes poco formales.
+2. Si el usuario hace una consulta (obra social, horarios, precios, información general), respondé la consulta directamente. NO inicies ni continúes una reserva.
+3. Solo usá shouldContinueWithFlow=true si el usuario está claramente respondiendo el paso actual del flujo de reserva.
+4. Si hay un flujo de reserva activo pero el usuario hace una pregunta distinta, respondé la pregunta y NO continúes el flujo.
+5. Sé breve, profesional y útil. Usá español rioplatense moderado.
 
 Respondé únicamente con un JSON válido con este formato:
 {
   "responseText": "tu respuesta al usuario",
   "intent": {
-    "action": "menu" | "reservar" | "misreservas" | "servicios" | "profesionales" | "unknown",
+    "action": "menu" | "reservar" | "misreservas" | "servicios" | "profesionales" | "consulta" | "unknown",
     "parameters": {
       "profesional": "nombre del profesional si el usuario lo mencionó",
       "servicio": "nombre del servicio si el usuario lo mencionó",
@@ -889,7 +1084,9 @@ export async function POST(request: NextRequest) {
       // ── Manejar callbacks ────────────────────────────────────────────
       if (data === 'menu') {
         await clearState();
-        await sendWithKeyboard('Hola 👋 ¿Qué necesitás?\n*(Atención particular, sin obra social)*', [
+        await sendWithKeyboard(
+          '¡Hola! 👋 Soy el asistente de la clínica.\n\n¿En qué puedo ayudarte hoy?\n*(Atención particular, sin obra social)*',
+          [
           [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
           [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
           [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
@@ -1137,12 +1334,28 @@ export async function POST(request: NextRequest) {
       };
 
       const showMainMenu = async () => {
-        await sendWithKeyboard('Hola 👋 ¿Qué necesitás?\n*(Atención particular, sin obra social)*', [
-          [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
-          [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
-          [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
-          [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
-        ]);
+        await sendWithKeyboard(
+          '¡Hola! 👋 Soy el asistente de la clínica.\n\n¿En qué puedo ayudarte hoy?\n*(Atención particular, sin obra social)*',
+          [
+            [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
+            [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
+            [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
+            [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
+          ]
+        );
+      };
+
+      const showInfoResponse = async (infoType: 'obra_social' | 'horarios' | 'precios') => {
+        if (infoType === 'obra_social') {
+          await sendWithKeyboard(
+            '🏥 *Obra social*\n\nEn este momento *no recibimos obra social*. La atención es *particular*.\n\nSi querés, puedo mostrarte servicios, horarios o ayudarte a reservar un turno.',
+            ASSIST_KEYBOARD
+          );
+        } else if (infoType === 'horarios') {
+          await sendWithKeyboard(await buildHorariosInfoMessage(), ASSIST_KEYBOARD);
+        } else {
+          await sendWithKeyboard(await buildPreciosInfoMessage(), ASSIST_KEYBOARD);
+        }
       };
 
       const showServices = async () => {
@@ -1159,12 +1372,32 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
+      const infoQuery = parseInfoQuery(text);
+      if (infoQuery) {
+        await clearState();
+        await showInfoResponse(infoQuery);
+        return NextResponse.json({ status: 'ok' });
+      }
+
       const localIntent = parseLocalIntent(text);
       const aiResult = localIntent
         ? { responseText: '', intent: localIntent, shouldContinueWithFlow: false }
         : await getGroqResponse(text, estado);
 
-      if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
+      if (aiResult.intent.action === 'consulta') {
+        await clearState();
+        const consultaInfo = parseInfoQuery(text);
+        if (consultaInfo) {
+          await showInfoResponse(consultaInfo);
+        } else if (aiResult.responseText) {
+          await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
+        } else {
+          await sendWithKeyboard(
+            'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
+            ASSIST_KEYBOARD
+          );
+        }
+      } else if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
         if (aiResult.intent.action === 'menu') {
           await clearState();
           await showMainMenu();
@@ -1235,8 +1468,8 @@ export async function POST(request: NextRequest) {
             
             if (aiResult.intent.parameters?.profesional) {
               // Find the professional
-              const prof = profesionales.find(p => 
-                p.toLowerCase().includes(aiResult.intent.parameters!.profesional!.toLowerCase())
+              const prof = profesionales.find(p =>
+                matchesLoosely(p, aiResult.intent.parameters!.profesional!)
               );
               if (prof) {
                 newEstado.profesional = prof;
@@ -1246,8 +1479,8 @@ export async function POST(request: NextRequest) {
             
             if (aiResult.intent.parameters?.servicio) {
               const servicios = await getServiciosList();
-              const serv = servicios.find(s => 
-                s.nombre.toLowerCase().includes(aiResult.intent.parameters!.servicio!.toLowerCase())
+              const serv = servicios.find(s =>
+                matchesLoosely(s.nombre, aiResult.intent.parameters!.servicio!)
               );
               if (serv) {
                 newEstado.servicio = serv.nombre;
@@ -1298,7 +1531,7 @@ export async function POST(request: NextRequest) {
         } else {
           await sendWithKeyboard(aiResult.responseText);
         }
-      } else if (estado?.paso) {
+      } else if (estado?.paso && (aiResult.shouldContinueWithFlow || isValidFlowInput(text, estado.paso))) {
         console.log('Continuing with existing flow, estado:', estado);
 
         if (estado.paso === 'profesional') {
@@ -1308,7 +1541,7 @@ export async function POST(request: NextRequest) {
           if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
             profSeleccionado = profesionales[num - 1];
           } else {
-            profSeleccionado = profesionales.find(p => p.toLowerCase().includes(text.toLowerCase()));
+            profSeleccionado = profesionales.find(p => matchesLoosely(p, text));
           }
           if (profSeleccionado) {
             const servicios = await getServiciosList();
@@ -1327,7 +1560,7 @@ export async function POST(request: NextRequest) {
           if (!isNaN(num) && num >= 1 && num <= servicios.length) {
             servicioSeleccionado = servicios[num - 1].nombre;
           } else {
-            servicioSeleccionado = servicios.find(s => s.nombre.toLowerCase().includes(text.toLowerCase()))?.nombre;
+            servicioSeleccionado = servicios.find(s => matchesLoosely(s.nombre, text))?.nombre;
           }
 
           if (servicioSeleccionado) {
@@ -1361,7 +1594,7 @@ export async function POST(request: NextRequest) {
             );
           } else {
             const view = await buildFechasView(estado.servicio, estado.profesional);
-            await sendWithKeyboard('Elegí un día de la lista:', view.keyboard);
+            await sendWithKeyboard('No pude interpretar esa fecha. Elegí un día de la lista:', view.keyboard);
           }
 
         } else if (estado.paso === 'hora') {
@@ -1402,8 +1635,17 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard('Por favor usá los botones para confirmar o cancelar:\n\n' + view.text, view.keyboard);
         }
       } else if (aiResult.responseText) {
-        await sendWithKeyboard(aiResult.responseText);
-        await showMainMenu();
+        await clearState();
+        await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
+      } else if (estado?.paso) {
+        await clearState();
+        await sendWithKeyboard(
+          'Interrumpí la reserva anterior para atender tu consulta. Si querés, podemos empezar de nuevo:',
+          [
+            [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
+            [{ text: '🏠 Menú principal', callback_data: 'menu' }]
+          ]
+        );
       } else {
         await showMainMenu();
       }
