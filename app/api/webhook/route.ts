@@ -5,11 +5,22 @@ import { getLocalReservations, addLocalReservation } from '../admin/reservations
 import {
   BotIntent,
   isValidFlowInput,
+  isValidPersonName,
   matchesLoosely,
   normalizeHumanText,
   parseInfoQuery,
   parseLocalIntent,
 } from '@/lib/bot-intent';
+import {
+  BTN,
+  buildBookingCard,
+  buildSuccessMessage,
+  capitalizeName,
+  formatDateAR,
+  formatPriceAR,
+  shortBookingCode,
+  withFlowProgress,
+} from '@/lib/booking-copy';
 import { appendChatMessage, formatChatHistoryForPrompt, getChatHistory } from '@/lib/chat-memory';
 import {
   crearEventoCalendar,
@@ -221,14 +232,7 @@ async function esDiaLaborable(fechaStr: string, profesional?: string): Promise<b
 
 // Función para formatear fecha de forma legible
 function formatDate(fechaStr: string): string {
-  const fecha = new Date(fechaStr + 'T12:00:00');
-  const options: Intl.DateTimeFormatOptions = {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric'
-  };
-  return fecha.toLocaleDateString('es-ES', options);
+  return formatDateAR(fechaStr);
 }
 
 async function proximosDiasLaborables(cantidad: number, profesional?: string): Promise<{ fecha: string; label: string }[]> {
@@ -284,15 +288,16 @@ async function buildFechasKeyboard(profesional?: string) {
       }))
     );
   }
-  keyboard.push([{ text: '🏠 Menú principal', callback_data: 'menu' }]);
+  keyboard.push([BTN.MENU]);
   return keyboard;
 }
 
 async function buildFechasView(servicio?: string, profesional?: string) {
+  const header = servicio
+    ? `📅 *${servicio}*${profesional ? `\n👨‍⚕️ ${profesional}` : ''}\n\n¿Qué día preferís?`
+    : '📅 ¿Qué día te gustaría?';
   return {
-    text: servicio
-      ? `📅 *${servicio}*\n\n¿Qué día preferís?`
-      : '📅 ¿Qué día te gustaría?',
+    text: withFlowProgress('fecha', header),
     keyboard: await buildFechasKeyboard(profesional)
   };
 }
@@ -400,34 +405,59 @@ async function buildHorariosView(
   excludeReservaId?: string
 ) {
   const horariosLibres = await obtenerHorariosLibres(fechaStr, profesional, servicio, excludeReservaId);
+  const serv = await getServicio(servicio);
 
   if (horariosLibres.length === 0) {
+    // Sugerir próxima fecha con turnos
+    const proximas = await proximosDiasLaborables(10, profesional);
+    const siguientes: Array<{ fecha: string; label: string }> = [];
+    for (const d of proximas) {
+      if (d.fecha === fechaStr) continue;
+      const libres = await obtenerHorariosLibres(d.fecha, profesional, servicio, excludeReservaId);
+      if (libres.length > 0) {
+        siguientes.push(d);
+        if (siguientes.length >= 2) break;
+      }
+    }
+
+    const keyboard: any[] = siguientes.map(d => [
+      { text: `📅 Ver ${d.label}`, callback_data: `fecha:${d.fecha}` }
+    ]);
+    keyboard.push([{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }]);
+    keyboard.push([BTN.MENU]);
+
     return {
-      text:
-        `😕 No hay turnos disponibles para *${servicio}* el ${formatDate(fechaStr)} con ${profesional}.\n\n` +
-        `Podés probar con otra fecha o volver al menú:`,
-      keyboard: [
-        [{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }],
-        [{ text: '🏠 Menú principal', callback_data: 'menu' }]
-      ]
+      text: withFlowProgress(
+        'hora',
+        `😕 No hay turnos libres para *${servicio}* el ${formatDate(fechaStr)} con ${profesional}.\n\n` +
+          (siguientes.length
+            ? 'Probá con una de estas fechas disponibles:'
+            : 'Probá con otra fecha o volvé al menú:')
+      ),
+      keyboard
     };
   }
 
-  // Botones de horario en filas de 3
   const keyboard: any[] = [];
   for (let i = 0; i < horariosLibres.length; i += 3) {
     keyboard.push(
       horariosLibres.slice(i, i + 3).map(h => ({ text: `🕐 ${h}`, callback_data: `hora:${h}` }))
     );
   }
-  // Botones de navegación al final
   keyboard.push([
     { text: '📅 Cambiar fecha', callback_data: 'cambiar_fecha' },
-    { text: '🏠 Menú', callback_data: 'menu' }
+    BTN.MENU
   ]);
 
+  const duracion = serv ? ` · ${serv.duracionMinutos} min` : '';
   return {
-    text: `🗓 *${servicio}*\n📅 ${formatDate(fechaStr)}\n\n⏰ Elegí un horario:`,
+    text: withFlowProgress(
+      'hora',
+      `🗓 *${servicio}*${duracion}\n` +
+        `👨‍⚕️ ${profesional}\n` +
+        `📅 ${formatDate(fechaStr)}\n\n` +
+        `⏰ Elegí un horario:`
+    ),
     keyboard
   };
 }
@@ -436,23 +466,33 @@ async function buildHorariosView(
 async function buildConfirmacionView(estado: ConversationState) {
   const serv = await getServicio(estado.servicio || '');
   const isReschedule = Boolean(estado.rescheduleId);
+  const card = buildBookingCard({
+    profesional: estado.profesional || '',
+    servicio: estado.servicio || '',
+    nombre: estado.nombre || '',
+    fecha: estado.fecha!,
+    hora: estado.hora!,
+    duracionMinutos: serv?.duracionMinutos,
+    precio: serv?.precio,
+    includeDisclaimer: true,
+  });
 
   return {
-    text:
-      `${isReschedule ? '🔄 *Confirmá el cambio de turno*' : '✅ *Confirmá tu turno*'}\n\n` +
-      `👨‍⚕️ *Profesional:* ${estado.profesional}\n` +
-      `🩺 *Servicio:* ${estado.servicio} (${serv ? '$'+serv.precio : ''})\n` +
-      `👤 *Nombre:* ${estado.nombre}\n` +
-      `📅 *Fecha:* ${formatDate(estado.fecha!)}\n` +
-      `🕐 *Hora:* ${estado.hora}\n\n` +
-      `*⚠️ Importante:* La atención es particular (no se recibe obra social).\n\n` +
-      `${isReschedule ? '¿Confirmás el cambio?' : '¿Confirmás la reserva?'}`,
+    text: withFlowProgress(
+      'confirmar',
+      `${isReschedule ? '🔄 *Confirmá el cambio de turno*' : '✅ *Revisá tu turno*'}\n\n` +
+        `${card}\n\n` +
+        `${isReschedule ? '¿Confirmás el cambio?' : '¿Todo correcto? Confirmá y listo.'}`
+    ),
     keyboard: [
       [
         { text: '✅ Confirmar', callback_data: isReschedule ? 'confirmar_reprogramar' : 'confirmar_reserva' },
-        { text: '❌ Cancelar', callback_data: isReschedule ? 'misreservas' : 'cambiar_fecha' }
       ],
-      [{ text: '🏠 Menú principal', callback_data: 'menu' }]
+      [
+        { text: '🕐 Cambiar horario', callback_data: 'refresh_horarios' },
+        { text: '📅 Cambiar fecha', callback_data: 'cambiar_fecha' },
+      ],
+      [BTN.CANCEL_FLOW]
     ]
   };
 }
@@ -511,7 +551,7 @@ async function verificarDisponibilidad(
     return { disponible: true };
   } catch (error) {
     console.error('Error al verificar disponibilidad:', error);
-    return { disponible: false, mensaje: 'Error al verificar disponibilidad. Intenta más tarde.' };
+    return { disponible: false, mensaje: 'Error al verificar disponibilidad. Intentá más tarde.' };
   }
 }
 
@@ -745,31 +785,31 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
 
 // Groq Integration
 const ASSIST_KEYBOARD = [
-  [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
-  [{ text: '📋 Ver servicios', callback_data: 'servicios' }, { text: '🏠 Menú', callback_data: 'menu' }]
+  [BTN.RESERVAR],
+  [{ text: '📋 Ver servicios', callback_data: 'servicios' }, BTN.MENU]
 ];
 
-const FLOW_CANCEL_KEYBOARD = [[{ text: '❌ Cancelar reserva', callback_data: 'menu' }]];
+const FLOW_CANCEL_KEYBOARD = [[BTN.CANCEL_FLOW]];
 
 async function buildProfesionalesKeyboard() {
   const profesionales = await getProfesionales();
   return [
     ...profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }]),
     [{ text: '🎲 Al azar', callback_data: 'aleatorio_profesional' }],
-    [{ text: '🏠 Menú', callback_data: 'menu' }]
+    [BTN.MENU]
   ];
 }
 
 async function buildServiciosKeyboard(forBooking = true) {
   const servicios = await getServiciosList();
   const rows = servicios.map(s => [{
-    text: `${s.nombre} ($${s.precio.toLocaleString('es-AR')})`,
+    text: `${s.nombre} (${formatPriceAR(s.precio)})`,
     callback_data: forBooking ? `servicio:${s.nombre}` : `reservar_servicio:${s.nombre}`
   }]);
   if (forBooking) {
     rows.push([{ text: '🎲 Al azar', callback_data: 'aleatorio_servicio' }]);
   }
-  rows.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
+  rows.push([BTN.MENU]);
   return rows;
 }
 
@@ -791,19 +831,42 @@ async function getContextualKeyboard(estado: ConversationState, _chatId?: number
       return FLOW_CANCEL_KEYBOARD;
     }
     case 'confirmar': {
-      const isReschedule = Boolean(estado.rescheduleId);
-      return [
-        [
-          { text: '✅ Confirmar', callback_data: isReschedule ? 'confirmar_reprogramar' : 'confirmar_reserva' },
-          { text: '❌ Cancelar', callback_data: isReschedule ? 'misreservas' : 'cambiar_fecha' }
-        ],
-        [{ text: '🏠 Menú principal', callback_data: 'menu' }]
-      ];
+      const view = await buildConfirmacionView(estado);
+      return view.keyboard;
     }
     default:
       return ASSIST_KEYBOARD;
   }
 }
+
+/** Pide nombre o confirma el del perfil (precisión / wow). */
+async function buildNombreStep(estado: ConversationState, chatId: number, prefix = '') {
+  const profile = await getUserProfile(chatId, kv);
+  const known = estado.nombre || profile?.nombre;
+
+  if (known) {
+    return {
+      estado: { ...estado, paso: 'nombre', nombre: known } as ConversationState,
+      text: withFlowProgress(
+        'nombre',
+        `${prefix}¿Reservo a nombre de *${known}*?`
+      ),
+      keyboard: [
+        [{ text: `✅ Sí, soy ${known.split(' ')[0]}`, callback_data: 'usar_nombre' }],
+        [{ text: '✏️ Otro nombre', callback_data: 'cambiar_nombre' }],
+        [BTN.CANCEL_FLOW]
+      ]
+    };
+  }
+
+  return {
+    estado: { ...estado, paso: 'nombre', nombre: undefined } as ConversationState,
+    text: withFlowProgress('nombre', `${prefix}¿Cuál es tu nombre?`),
+    keyboard: FLOW_CANCEL_KEYBOARD
+  };
+}
+
+const POST_BOOKING_KEYBOARD = [[BTN.MIS_RESERVAS], [BTN.MENU]];
 
 const DAY_NAMES = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
 
@@ -1002,19 +1065,35 @@ async function resolveTextIntent(
 
 async function buildMisReservasKeyboard(reservasArray: Reservation[]) {
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+  const now = Date.now();
 
-  for (const reservation of reservasArray) {
+  const futuras = reservasArray.filter(r => {
+    const at = new Date(`${r.fecha}T${r.hora}:00`).getTime();
+    return at >= now - 60 * 60 * 1000; // incluir hasta 1h después por tolerancia
+  });
+
+  for (const reservation of futuras) {
+    const shortName = reservation.profesional.split(' ')[0];
+    const label = `${formatDateShortSafe(reservation.fecha)} · ${reservation.hora} · ${reservation.servicio}`;
     keyboard.push([
-      { text: `${reservation.servicio} — ${formatDate(reservation.fecha)} ${reservation.hora}`, callback_data: 'noop' }
+      { text: label.length > 60 ? label.slice(0, 57) + '…' : label, callback_data: `ver_reserva:${reservation.id}` }
     ]);
     keyboard.push([
-      { text: '🔄 Cambiar', callback_data: `reprogramar:${reservation.id}` },
-      { text: '❌ Eliminar', callback_data: `eliminar:${reservation.id}` }
+      { text: `🔄 Cambiar (${shortName})`, callback_data: `reprogramar:${reservation.id}` },
+      { text: '❌ Cancelar', callback_data: `confirmar_eliminar:${reservation.id}` }
     ]);
   }
 
-  keyboard.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
-  return keyboard;
+  keyboard.push([BTN.MENU]);
+  return { keyboard, futuras, pastCount: reservasArray.length - futuras.length };
+}
+
+function formatDateShortSafe(fechaStr: string): string {
+  const fecha = new Date(fechaStr + 'T12:00:00');
+  const weekday = fecha.toLocaleDateString('es-AR', { weekday: 'short' });
+  const day = fecha.getDate();
+  const month = fecha.toLocaleDateString('es-AR', { month: 'short' });
+  return `${weekday.charAt(0).toUpperCase() + weekday.slice(1)} ${day} ${month.charAt(0).toUpperCase() + month.slice(1)}`;
 }
 
 async function getRescheduleOptions(chatId: number, rescheduleId?: string) {
@@ -1240,12 +1319,55 @@ export async function POST(request: NextRequest) {
             'Todavía no tenés reservas. ¿Querés hacer una?',
             [
               [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
-              [{ text: '🏠 Menú', callback_data: 'menu' }]
+              [BTN.MENU]
             ]
           );
         } else {
-          const keyboard = await buildMisReservasKeyboard(reservasArray);
-          await sendWithKeyboard('📋 *Tus reservas:*', keyboard);
+          const { keyboard, futuras, pastCount } = await buildMisReservasKeyboard(reservasArray);
+          if (futuras.length === 0) {
+            await sendWithKeyboard(
+              pastCount > 0
+                ? 'No tenés turnos próximos. ¿Querés reservar uno nuevo?'
+                : 'Todavía no tenés reservas. ¿Querés hacer una?',
+              [[BTN.RESERVAR], [BTN.MENU]]
+            );
+          } else {
+            await sendWithKeyboard(
+              `📋 *Tus turnos*\n\nTocá *Cambiar* o *Cancelar* en cada uno.${pastCount > 0 ? `\n_(${pastCount} turno${pastCount > 1 ? 's' : ''} pasado${pastCount > 1 ? 's' : ''} oculto${pastCount > 1 ? 's' : ''})_` : ''}`,
+              keyboard
+            );
+          }
+        }
+
+      } else if (data.startsWith('ver_reserva:')) {
+        const reservaId = data.replace('ver_reserva:', '');
+        const reserva = await getReservaById(chatId, reservaId);
+        if (!reserva) {
+          await sendWithKeyboard('No encontré esa reserva.', [[BTN.MIS_RESERVAS], [BTN.MENU]]);
+        } else {
+          const serv = await getServicio(reserva.servicio);
+          await sendWithKeyboard(
+            `📌 *Detalle del turno*\n\n` +
+              buildBookingCard({
+                profesional: reserva.profesional,
+                servicio: reserva.servicio,
+                nombre: reserva.nombre,
+                fecha: reserva.fecha,
+                hora: reserva.hora,
+                duracionMinutos: serv?.duracionMinutos,
+                precio: serv?.precio,
+                codigo: shortBookingCode(reserva.id),
+                includeDisclaimer: true,
+              }),
+            [
+              [
+                { text: '🔄 Cambiar', callback_data: `reprogramar:${reserva.id}` },
+                { text: '❌ Cancelar turno', callback_data: `confirmar_eliminar:${reserva.id}` }
+              ],
+              [BTN.MIS_RESERVAS],
+              [BTN.MENU]
+            ]
+          );
         }
 
       } else if (data.startsWith('reprogramar:')) {
@@ -1253,7 +1375,7 @@ export async function POST(request: NextRequest) {
         const reserva = await getReservaById(chatId, reservaId);
 
         if (!reserva) {
-          await sendWithKeyboard('No encontré esa reserva.', [[{ text: '🏠 Menú', callback_data: 'menu' }]]);
+          await sendWithKeyboard('No encontré esa reserva.', [[BTN.MENU]]);
         } else {
           await saveState({
             paso: 'fecha',
@@ -1265,27 +1387,65 @@ export async function POST(request: NextRequest) {
             hora: reserva.hora,
           });
           const view = await buildFechasView(reserva.servicio, reserva.profesional);
-          await sendWithKeyboard(`🔄 *Cambiar turno*\n\nElegí la nueva fecha:\n\n${view.text}`, view.keyboard);
+          await sendWithKeyboard(`🔄 *Cambiar turno*\n\n${view.text}`, view.keyboard);
+        }
+
+      } else if (data.startsWith('confirmar_eliminar:')) {
+        const reservaId = data.replace('confirmar_eliminar:', '');
+        const reserva = await getReservaById(chatId, reservaId);
+        if (!reserva) {
+          await sendWithKeyboard('No encontré esa reserva.', [[BTN.MIS_RESERVAS], [BTN.MENU]]);
+        } else {
+          await sendWithKeyboard(
+            `⚠️ *¿Cancelar este turno?*\n\n` +
+              `👨‍⚕️ ${reserva.profesional}\n` +
+              `🩺 ${reserva.servicio}\n` +
+              `📅 ${formatDate(reserva.fecha)} · ${reserva.hora}\n\n` +
+              `Esta acción no se puede deshacer.`,
+            [
+              [{ text: '✅ Sí, cancelar turno', callback_data: `eliminar:${reservaId}` }],
+              [{ text: '↩️ Volver', callback_data: 'misreservas' }]
+            ]
+          );
         }
 
       } else if (data.startsWith('eliminar:')) {
         const reservaId = data.replace('eliminar:', '');
+        const reservaAntes = await getReservaById(chatId, reservaId);
         const eliminado = await eliminarReserva(chatId, reservaId);
 
         if (eliminado) {
           await sendWithKeyboard(
-            '✅ Reserva eliminada correctamente.',
+            reservaAntes
+              ? `✅ Turno cancelado\n\n📅 ${formatDate(reservaAntes.fecha)} · ${reservaAntes.hora}\n🩺 ${reservaAntes.servicio} con ${reservaAntes.profesional}`
+              : '✅ Reserva eliminada correctamente.',
             [
-              [{ text: '📋 Mis reservas', callback_data: 'misreservas' }],
-              [{ text: '🏠 Menú', callback_data: 'menu' }]
+              [BTN.MIS_RESERVAS],
+              [BTN.MENU]
             ]
           );
         } else {
           await sendWithKeyboard(
             'No se pudo eliminar la reserva.',
-            [[{ text: '🏠 Menú', callback_data: 'menu' }]]
+            [[BTN.MENU]]
           );
         }
+
+      } else if (data === 'usar_nombre') {
+        if (!estado.nombre || !estado.servicio || !estado.profesional) {
+          await sendWithKeyboard('Sigamos desde el principio:', await buildProfesionalesKeyboard());
+        } else {
+          await saveState({ ...estado, paso: 'fecha' });
+          const view = await buildFechasView(estado.servicio, estado.profesional);
+          await sendWithKeyboard(`Perfecto, *${estado.nombre}* 👋\n\n${view.text}`, view.keyboard);
+        }
+
+      } else if (data === 'cambiar_nombre') {
+        await saveState({ ...estado, paso: 'nombre', nombre: undefined });
+        await sendWithKeyboard(
+          withFlowProgress('nombre', 'Dale, ¿cuál es tu nombre?'),
+          FLOW_CANCEL_KEYBOARD
+        );
 
       } else if (data === 'aleatorio_profesional') {
         const profesionales = await getProfesionales();
@@ -1358,25 +1518,29 @@ export async function POST(request: NextRequest) {
 
         // Si ya tenía servicio (vino desde catálogo), saltear ese paso
         if (estado.servicio) {
-          const profile = await getUserProfile(chatId, kv);
-          const nombreGuardado = estado.nombre || profile?.nombre;
-          if (nombreGuardado) {
+          if (estado.nombre || estado.rescheduleId) {
+            const nombre = estado.nombre!;
             await saveState({
               ...estado,
               paso: 'fecha',
               profesional: profSeleccionado,
-              nombre: nombreGuardado,
+              nombre,
             });
             const view = await buildFechasView(estado.servicio, profSeleccionado);
-            await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\nHola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
+            await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\nHola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
           } else {
-            await saveState({ ...estado, paso: 'nombre', profesional: profSeleccionado });
-            await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
+            const step = await buildNombreStep(
+              { ...estado, profesional: profSeleccionado },
+              chatId,
+              `*${profSeleccionado}* ✔️\n\n`
+            );
+            await saveState(step.estado);
+            await sendWithKeyboard(step.text, step.keyboard);
           }
         } else {
           await saveState({ ...estado, paso: 'servicio', profesional: profSeleccionado });
           await sendWithKeyboard(
-            `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
+            withFlowProgress('servicio', `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`),
             await buildServiciosKeyboard(true)
           );
         }
@@ -1385,8 +1549,6 @@ export async function POST(request: NextRequest) {
         const servicioSeleccionado = data.startsWith('reservar_servicio:')
           ? data.replace('reservar_servicio:', '')
           : data.replace('servicio:', '');
-        const profile = await getUserProfile(chatId, kv);
-        const nombreGuardado = estado.nombre || profile?.nombre;
 
         // Desde catálogo sin profesional: pedir profesional con servicio preseleccionado
         if (!estado.profesional && !estado.paso) {
@@ -1394,23 +1556,23 @@ export async function POST(request: NextRequest) {
           if (limitReached) {
             await sendWithKeyboard(
               '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos. Cancelá uno desde Mis reservas.',
-              [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+              [[BTN.MIS_RESERVAS], [BTN.MENU]]
             );
           } else {
             await saveState({ paso: 'profesional', servicio: servicioSeleccionado });
             await sendWithKeyboard(
-              `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+              withFlowProgress('profesional', `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`),
               await buildProfesionalesKeyboard()
             );
           }
         } else if (!estado.profesional) {
           await saveState({ ...estado, paso: 'profesional', servicio: servicioSeleccionado });
           await sendWithKeyboard(
-            `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+            withFlowProgress('profesional', `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`),
             await buildProfesionalesKeyboard()
           );
-        } else if (nombreGuardado && estado.fecha) {
-          await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado, nombre: nombreGuardado });
+        } else if ((estado.nombre || estado.rescheduleId) && estado.fecha) {
+          await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado });
           const view = await buildHorariosView(
             estado.fecha,
             servicioSeleccionado,
@@ -1418,13 +1580,18 @@ export async function POST(request: NextRequest) {
             estado.rescheduleId
           );
           await sendWithKeyboard(view.text, view.keyboard);
-        } else if (nombreGuardado) {
-          await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado, nombre: nombreGuardado });
+        } else if (estado.nombre || estado.rescheduleId) {
+          await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado });
           const view = await buildFechasView(servicioSeleccionado, estado.profesional);
-          await sendWithKeyboard(`Hola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
+          await sendWithKeyboard(`Hola *${estado.nombre}* 👋\n\n${view.text}`, view.keyboard);
         } else {
-          await saveState({ ...estado, paso: 'nombre', servicio: servicioSeleccionado });
-          await sendWithKeyboard(`*${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
+          const step = await buildNombreStep(
+            { ...estado, servicio: servicioSeleccionado },
+            chatId,
+            `*${servicioSeleccionado}* ✔️\n\n`
+          );
+          await saveState(step.estado);
+          await sendWithKeyboard(step.text, step.keyboard);
         }
 
       } else if (data === 'cambiar_fecha') {
@@ -1511,17 +1678,10 @@ export async function POST(request: NextRequest) {
 
             if (reserva) {
               await clearState();
+              const serv = await getServicio(reserva.servicio);
               await sendWithKeyboard(
-                `🔄 *Turno reprogramado*\n\n` +
-                  `👨‍⚕️ ${reserva.profesional}\n` +
-                  `✨ *${reserva.servicio}*\n` +
-                  `📅 ${formatDate(reserva.fecha)}\n` +
-                  `🕐 ${reserva.hora}\n\n` +
-                  `Te vamos a enviar recordatorios antes del turno.`,
-                [
-                  [{ text: '📋 Mis reservas', callback_data: 'misreservas' }],
-                  [{ text: '🏠 Menú', callback_data: 'menu' }]
-                ]
+                buildSuccessMessage(reserva, serv, true),
+                POST_BOOKING_KEYBOARD
               );
             } else {
               const viewActualizada = await buildHorariosView(
@@ -1567,18 +1727,10 @@ export async function POST(request: NextRequest) {
 
           if (reserva) {
             await clearState();
+            const serv = await getServicio(reserva.servicio);
             await sendWithKeyboard(
-              `🎉 *¡Reserva confirmada!*\n\n` +
-              `👨‍⚕️ ${reserva.profesional}\n` +
-              `✨ *${reserva.servicio}*\n` +
-              `📅 ${formatDate(reserva.fecha)}\n` +
-              `🕐 ${reserva.hora}\n` +
-              `👤 ${reserva.nombre}\n\n` +
-              `¡Nos vemos! 😊\n\nTe vamos a enviar recordatorios antes del turno.`,
-              [
-                [{ text: '📋 Mis reservas', callback_data: 'misreservas' }],
-                [{ text: '🏠 Menú', callback_data: 'menu' }]
-              ]
+              buildSuccessMessage(reserva, serv, false),
+              POST_BOOKING_KEYBOARD
             );
           } else {
             // El slot fue tomado justo antes: mostrar horarios actualizados
@@ -1752,12 +1904,22 @@ export async function POST(request: NextRequest) {
               'Todavía no tenés reservas. ¿Querés hacer una?',
               [
                 [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
-                [{ text: '🏠 Menú', callback_data: 'menu' }]
+                [BTN.MENU]
               ]
             );
           } else {
-            const keyboard = await buildMisReservasKeyboard(reservasArray);
-            await sendWithKeyboard('📋 *Tus reservas:*', keyboard);
+            const { keyboard, futuras, pastCount } = await buildMisReservasKeyboard(reservasArray);
+            if (futuras.length === 0) {
+              await sendWithKeyboard(
+                'No tenés turnos próximos. ¿Querés reservar uno nuevo?',
+                [[BTN.RESERVAR], [BTN.MENU]]
+              );
+            } else {
+              await sendWithKeyboard(
+                `📋 *Tus turnos*\n\nTocá *Cambiar* o *Cancelar* en cada uno.${pastCount > 0 ? `\n_(${pastCount} pasados ocultos)_` : ''}`,
+                keyboard
+              );
+            }
           }
         } else if (aiResult.intent.action === 'reservar') {
           const limitReached = await checkReservationLimit(chatId);
@@ -1918,10 +2080,21 @@ export async function POST(request: NextRequest) {
           }
 
         } else if (estado.paso === 'nombre') {
-          await saveState({ ...estado, paso: 'fecha', nombre: text });
-          await saveUserProfile(chatId, text, kv);
-          const view = await buildFechasView(estado.servicio, estado.profesional);
-          await sendWithKeyboard(`Hola *${text}* 👋\n\n${view.text}`, view.keyboard);
+          if (!isValidPersonName(text)) {
+            await sendWithKeyboard(
+              withFlowProgress(
+                'nombre',
+                'Necesito tu nombre real para la reserva (sin números ni frases). Por ejemplo: *María López*.'
+              ),
+              FLOW_CANCEL_KEYBOARD
+            );
+          } else {
+            const nombre = capitalizeName(text);
+            await saveState({ ...estado, paso: 'fecha', nombre });
+            await saveUserProfile(chatId, nombre, kv);
+            const view = await buildFechasView(estado.servicio, estado.profesional);
+            await sendWithKeyboard(`Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
+          }
 
         } else if (estado.paso === 'fecha') {
           const fechaParseada = parseFecha(text);
@@ -1967,8 +2140,11 @@ export async function POST(request: NextRequest) {
                 keyboard.push(filtered.slice(i, i + 3).map(h => ({ text: `🕐 ${h}`, callback_data: `hora:${h}` })));
               }
               keyboard.push([{ text: '📅 Ver todos', callback_data: 'refresh_horarios' }, { text: '🏠 Menú', callback_data: 'menu' }]);
-              const period = wantsMorning ? 'la mañana' : 'la tarde';
-              await sendWithKeyboard(`⏰ Turnos disponibles por ${period}:`, keyboard);
+              const period = wantsMorning ? 'la mañana (antes de las 13)' : 'la tarde (desde las 13)';
+              await sendWithKeyboard(
+                withFlowProgress('hora', `⏰ Turnos disponibles por ${period}:`),
+                keyboard
+              );
             } else {
               const period = wantsMorning ? 'la mañana' : 'la tarde';
               const view = await buildHorariosView(estado.fecha!, estado.servicio!, estado.profesional!, estado.rescheduleId);
@@ -2031,9 +2207,10 @@ export async function POST(request: NextRequest) {
                 const reserva = await reprogramarReserva(chatId, estado.rescheduleId, estado.fecha!, estado.hora!);
                 if (reserva) {
                   await clearState();
+                  const serv = await getServicio(reserva.servicio);
                   await sendWithKeyboard(
-                    `🔄 *Turno reprogramado*\n\n👨‍⚕️ ${reserva.profesional}\n✨ *${reserva.servicio}*\n📅 ${formatDate(reserva.fecha)}\n🕐 ${reserva.hora}\n\nTe enviamos recordatorios antes del turno.`,
-                    [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+                    buildSuccessMessage(reserva, serv, true),
+                    POST_BOOKING_KEYBOARD
                   );
                 }
               } else {
@@ -2047,9 +2224,10 @@ export async function POST(request: NextRequest) {
                 });
                 if (reserva) {
                   await clearState();
+                  const serv = await getServicio(reserva.servicio);
                   await sendWithKeyboard(
-                    `🎉 *¡Reserva confirmada!*\n\n👨‍⚕️ ${reserva.profesional}\n✨ *${reserva.servicio}*\n📅 ${formatDate(reserva.fecha)}\n🕐 ${reserva.hora}\n👤 ${reserva.nombre}\n\n¡Nos vemos! 😊`,
-                    [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+                    buildSuccessMessage(reserva, serv, false),
+                    POST_BOOKING_KEYBOARD
                   );
                 } else {
                   const viewActualizada = await buildHorariosView(estado.fecha!, estado.servicio!, estado.profesional!);
@@ -2079,13 +2257,11 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
         }
       } else if (estado?.paso) {
-        await clearState();
+        // No cortar el flujo: el usuario se equivocó, lo guiamos de nuevo
+        const contextKeyboard = await getContextualKeyboard(estado);
         await sendWithKeyboard(
-          'Interrumpí la reserva anterior para atender tu consulta. Si querés, podemos empezar de nuevo:',
-          [
-            [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
-            [{ text: '🏠 Menú principal', callback_data: 'menu' }]
-          ]
+          'No te entendí del todo 🙏 Seguimos con la reserva. Elegí una opción o respondé lo que te pedí:',
+          contextKeyboard
         );
       } else {
         await showMainMenu();

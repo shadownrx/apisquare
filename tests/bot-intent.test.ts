@@ -8,6 +8,7 @@ import {
   parseLocalIntent,
   matchesLoosely,
   isValidFlowInput,
+  isValidPersonName,
 } from '../lib/bot-intent';
 
 describe('normalizeHumanText', () => {
@@ -123,5 +124,13 @@ describe('isValidFlowInput', () => {
 
   it('rechaza nombres demasiado largos o frases completas', () => {
     assert.equal(isValidFlowInput('Me llamo Juan Carlos Rodriguez Martinez Lopez', 'nombre'), false);
+  });
+
+  it('rechaza confirmaciones y basura como nombre', () => {
+    assert.equal(isValidPersonName('si'), false);
+    assert.equal(isValidPersonName('dale'), false);
+    assert.equal(isValidPersonName('ok'), false);
+    assert.equal(isValidPersonName('Juan'), true);
+    assert.equal(isValidPersonName('María López'), true);
   });
 });

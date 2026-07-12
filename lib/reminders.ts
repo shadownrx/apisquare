@@ -2,17 +2,8 @@ import axios from 'axios';
 import { createClient } from '@vercel/kv';
 import { getLocalReservations } from '@/app/api/admin/reservations/route';
 import { getAppointmentDate } from './googleCalendar';
+import { BTN, buildBookingCard, formatDateAR } from './booking-copy';
 import type { Reservation } from './types';
-
-function formatDate(fechaStr: string): string {
-  const fecha = new Date(fechaStr + 'T12:00:00');
-  return fecha.toLocaleDateString('es-AR', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  });
-}
 
 async function sendTelegramReminder(chatId: number, text: string) {
   const token = process.env.TELEGRAM_TOKEN;
@@ -23,6 +14,13 @@ async function sendTelegramReminder(chatId: number, text: string) {
       chat_id: chatId,
       text,
       parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [BTN.MIS_RESERVAS],
+          [BTN.MENU],
+        ],
+      },
     });
     return true;
   } catch (error) {
@@ -39,6 +37,22 @@ async function persistReservation(
   const idKey = `reserva:id:${reservation.id}`;
   await kv.set(key, JSON.stringify(reservation), { ex: 86400 * 30 });
   await kv.set(idKey, JSON.stringify(reservation), { ex: 86400 * 30 });
+
+  const userKey = `user:${reservation.chatId}:reservas`;
+  const userReservas = (await kv.get(userKey)) || [];
+  let reservasArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
+  reservasArray = reservasArray.map((r: Reservation) => (r.id === reservation.id ? reservation : r));
+  await kv.set(userKey, JSON.stringify(reservasArray));
+}
+
+function buildReminderCard(reservation: Reservation): string {
+  return buildBookingCard({
+    profesional: reservation.profesional,
+    servicio: reservation.servicio,
+    nombre: reservation.nombre,
+    fecha: reservation.fecha,
+    hora: reservation.hora,
+  });
 }
 
 export async function processReminders() {
@@ -74,16 +88,19 @@ export async function processReminders() {
 
     if (minutesUntil <= 0) continue;
 
-    if (!reservation.reminder24hSent && minutesUntil <= 24 * 60 && minutesUntil >= 23 * 60) {
+    // Ventana amplia: desde 24h hasta ~12h antes (cubre crons poco frecuentes)
+    if (!reservation.reminder24hSent && minutesUntil <= 24 * 60 && minutesUntil > 90) {
+      const whenLabel =
+        minutesUntil >= 20 * 60
+          ? `mañana (${formatDateAR(reservation.fecha)})`
+          : `el ${formatDateAR(reservation.fecha)}`;
+
       const sent = await sendTelegramReminder(
         reservation.chatId,
         `🔔 *Recordatorio de turno*\n\n` +
-          `Te recordamos que mañana tenés:\n` +
-          `👨‍⚕️ ${reservation.profesional}\n` +
-          `✨ *${reservation.servicio}*\n` +
-          `📅 ${formatDate(reservation.fecha)}\n` +
-          `🕐 ${reservation.hora}\n\n` +
-          `Si necesitás cambiarlo, andá a *Mis reservas*.`
+          `Te recordamos que ${whenLabel} tenés tu turno:\n\n` +
+          `${buildReminderCard(reservation)}\n\n` +
+          `Si necesitás cambiarlo o cancelarlo, tocá *Mis reservas*.`
       );
 
       if (sent) {
@@ -93,14 +110,14 @@ export async function processReminders() {
       }
     }
 
-    if (!reservation.reminder1hSent && minutesUntil <= 75 && minutesUntil >= 45) {
+    // Ventana 1h: desde 90 min hasta 30 min antes
+    if (!reservation.reminder1hSent && minutesUntil <= 90 && minutesUntil >= 30) {
+      const mins = Math.round(minutesUntil);
       const sent = await sendTelegramReminder(
         reservation.chatId,
         `⏰ *Tu turno es pronto*\n\n` +
-          `En aproximadamente 1 hora te esperamos:\n` +
-          `👨‍⚕️ ${reservation.profesional}\n` +
-          `✨ *${reservation.servicio}*\n` +
-          `🕐 ${reservation.hora}\n\n` +
+          `En unos *${mins} minutos* te esperamos:\n\n` +
+          `${buildReminderCard(reservation)}\n\n` +
           `¡Nos vemos en la clínica!`
       );
 

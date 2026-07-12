@@ -123,6 +123,46 @@ export function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'prec
   return null;
 }
 
+const NAME_STOPWORDS = new Set([
+  'si',
+  'sí',
+  'no',
+  'ok',
+  'okay',
+  'dale',
+  'listo',
+  'bueno',
+  'va',
+  'yes',
+  'nop',
+  'nope',
+  'cancelar',
+  'confirmar',
+  'confirmo',
+  'menu',
+  'menú',
+  'hola',
+  'buenas',
+  'gracias',
+  'por favor',
+  'nombre',
+  'mi nombre',
+]);
+
+export function isValidPersonName(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 2 || trimmed.length > 40) return false;
+  if (trimmed.split(/\s+/).length > 4) return false;
+  if (/\d/.test(trimmed)) return false;
+  if (!/^[\p{L}\s'.-]+$/u.test(trimmed)) return false;
+
+  const normalized = normalizeHumanText(trimmed);
+  if (NAME_STOPWORDS.has(normalized)) return false;
+  if (normalized.split(' ').every(w => NAME_STOPWORDS.has(w))) return false;
+
+  return true;
+}
+
 export function isValidFlowInput(text: string, paso: string): boolean {
   if (looksLikeQuestion(text)) return false;
 
@@ -130,11 +170,14 @@ export function isValidFlowInput(text: string, paso: string): boolean {
 
   switch (paso) {
     case 'nombre':
-      return trimmed.length >= 2 && trimmed.length <= 40 && trimmed.split(/\s+/).length <= 4;
+      return isValidPersonName(trimmed);
     case 'fecha':
       return parseFecha(text) !== null;
     case 'hora':
-      return /^\d{1,2}(:\d{2})?$/.test(trimmed);
+      return /^\d{1,2}(:\d{2})?$/.test(trimmed) ||
+        ['manana', 'mañana', 'tarde', 'por la manana', 'por la mañana', 'por la tarde'].some(
+          w => normalizeHumanText(trimmed).includes(normalizeHumanText(w))
+        );
     case 'profesional':
     case 'servicio':
       return trimmed.length > 0;
