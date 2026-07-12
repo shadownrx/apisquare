@@ -31,7 +31,7 @@ interface Config {
 }
 
 const SERVICE_ICONS: Record<string, string> = {
-  'Sesión de Quiropráctica': '🦴',
+  'Sesión de Quiropraxia': '🦴',
   'Masaje Relajante': '💆',
   'Traumatología': '🩺',
 };

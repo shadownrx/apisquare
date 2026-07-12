@@ -166,6 +166,12 @@ async function getConfig(): Promise<Config> {
     servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
   };
 
+  // Normalizar nombre legacy "Quiropráctica" → "Quiropraxia"
+  config.servicios = config.servicios.map(s => ({
+    ...s,
+    nombre: s.nombre.replace(/Quiropráctica/gi, 'Quiropraxia').replace(/quiropractica/gi, 'Quiropraxia')
+  }));
+
   return config;
 }
 
@@ -181,7 +187,11 @@ async function getServiciosList() {
 
 async function getServicio(nombre: string) {
   const servicios = await getServiciosList();
-  return servicios.find(s => s.nombre.toLowerCase() === nombre.toLowerCase());
+  const normalized = normalizeHumanText(nombre).replace(/quiropractica/g, 'quiropraxia');
+  return servicios.find(s => {
+    const sNorm = normalizeHumanText(s.nombre).replace(/quiropractica/g, 'quiropraxia');
+    return sNorm === normalized || sNorm.includes(normalized) || normalized.includes(sNorm);
+  });
 }
 
 async function getHorarioProfesional(profesional: string, dia: number): Promise<Array<{ inicio: string, fin: string }>> {
@@ -739,24 +749,38 @@ const ASSIST_KEYBOARD = [
   [{ text: '📋 Ver servicios', callback_data: 'servicios' }, { text: '🏠 Menú', callback_data: 'menu' }]
 ];
 
+const FLOW_CANCEL_KEYBOARD = [[{ text: '❌ Cancelar reserva', callback_data: 'menu' }]];
+
+async function buildProfesionalesKeyboard() {
+  const profesionales = await getProfesionales();
+  return [
+    ...profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }]),
+    [{ text: '🎲 Al azar', callback_data: 'aleatorio_profesional' }],
+    [{ text: '🏠 Menú', callback_data: 'menu' }]
+  ];
+}
+
+async function buildServiciosKeyboard(forBooking = true) {
+  const servicios = await getServiciosList();
+  const rows = servicios.map(s => [{
+    text: `${s.nombre} ($${s.precio.toLocaleString('es-AR')})`,
+    callback_data: forBooking ? `servicio:${s.nombre}` : `reservar_servicio:${s.nombre}`
+  }]);
+  if (forBooking) {
+    rows.push([{ text: '🎲 Al azar', callback_data: 'aleatorio_servicio' }]);
+  }
+  rows.push([{ text: '🏠 Menú', callback_data: 'menu' }]);
+  return rows;
+}
+
 async function getContextualKeyboard(estado: ConversationState, _chatId?: number): Promise<any[][]> {
   switch (estado.paso) {
-    case 'profesional': {
-      const profesionales = await getProfesionales();
-      return [
-        ...profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }]),
-        [{ text: '🏠 Menú', callback_data: 'menu' }]
-      ];
-    }
-    case 'servicio': {
-      const servicios = await getServiciosList();
-      return [
-        ...servicios.map(s => [{ text: `${s.nombre} ($${s.precio.toLocaleString('es-AR')})`, callback_data: `servicio:${s.nombre}` }]),
-        [{ text: '🏠 Menú', callback_data: 'menu' }]
-      ];
-    }
+    case 'profesional':
+      return buildProfesionalesKeyboard();
+    case 'servicio':
+      return buildServiciosKeyboard(true);
     case 'nombre':
-      return [[{ text: '🏠 Menú', callback_data: 'menu' }]];
+      return FLOW_CANCEL_KEYBOARD;
     case 'fecha':
       return await buildFechasKeyboard(estado.profesional);
     case 'hora': {
@@ -764,7 +788,7 @@ async function getContextualKeyboard(estado: ConversationState, _chatId?: number
         const view = await buildHorariosView(estado.fecha, estado.servicio, estado.profesional, estado.rescheduleId);
         return view.keyboard;
       }
-      return ASSIST_KEYBOARD;
+      return FLOW_CANCEL_KEYBOARD;
     }
     case 'confirmar': {
       const isReschedule = Boolean(estado.rescheduleId);
@@ -872,6 +896,10 @@ Tu rol es ENTENDER el mensaje, responder con calidez y CLASIFICAR la intención 
 
 ⚠️ REGLA MÁS IMPORTANTE: NO hagas preguntas sobre fecha, hora, profesional ni servicio en responseText.
 El sistema tiene botones y menús para eso. Solo respondé brevemente y clasificá.
+
+Si hay un FLUJO ACTIVO y el usuario pregunta algo (ej. "por qué querés saber"), respondé la duda en responseText con action "consulta". El sistema mantiene el flujo; NO inventes menús.
+
+El servicio se llama "Sesión de Quiropraxia" (NO "Quiropráctica").
 
 ${clinicContext}
 
@@ -1153,16 +1181,14 @@ export async function POST(request: NextRequest) {
         ]);
 
       } else if (data === 'profesionales') {
-        const profesionales = await getProfesionales();
         await sendWithKeyboard(
-          '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
-          profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+          '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar, o elegí al azar:',
+          await buildProfesionalesKeyboard()
         );
       } else if (data === 'servicios') {
-        const servicios = await getServiciosList();
         await sendWithKeyboard(
-          '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*',
-          servicios.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
+          '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*\n\nTocá un servicio para reservarlo:',
+          await buildServiciosKeyboard(false)
         );
 
       } else if (data === 'reservar') {
@@ -1173,11 +1199,10 @@ export async function POST(request: NextRequest) {
             [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
           );
         } else {
-          const profesionales = await getProfesionales();
           await saveState({ paso: 'profesional' });
           await sendWithKeyboard(
             '¿Con qué profesional te querés atender?',
-            profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+            await buildProfesionalesKeyboard()
           );
         }
 
@@ -1262,20 +1287,129 @@ export async function POST(request: NextRequest) {
           );
         }
 
-      } else if (data.startsWith('profesional:')) {
-        const profSeleccionado = data.replace('profesional:', '');
+      } else if (data === 'aleatorio_profesional') {
+        const profesionales = await getProfesionales();
+        const profSeleccionado = profesionales[Math.floor(Math.random() * profesionales.length)];
+        // Reutilizar la misma lógica que profesional:
+        if (estado.servicio) {
+          const profile = await getUserProfile(chatId, kv);
+          const nombreGuardado = estado.nombre || profile?.nombre;
+          if (nombreGuardado) {
+            await saveState({
+              ...estado,
+              paso: 'fecha',
+              profesional: profSeleccionado,
+              nombre: nombreGuardado,
+            });
+            const view = await buildFechasView(estado.servicio, profSeleccionado);
+            await sendWithKeyboard(
+              `🎲 Te tocó *${profSeleccionado}*\n\nHola *${nombreGuardado}* 👋\n\n${view.text}`,
+              view.keyboard
+            );
+          } else {
+            await saveState({ ...estado, paso: 'nombre', profesional: profSeleccionado });
+            await sendWithKeyboard(
+              `🎲 Te tocó *${profSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`,
+              FLOW_CANCEL_KEYBOARD
+            );
+          }
+        } else {
+          await saveState({ ...estado, paso: 'servicio', profesional: profSeleccionado });
+          await sendWithKeyboard(
+            `🎲 Te tocó *${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
+            await buildServiciosKeyboard(true)
+          );
+        }
+
+      } else if (data === 'aleatorio_servicio') {
         const servicios = await getServiciosList();
-        await saveState({ paso: 'servicio', profesional: profSeleccionado });
-        await sendWithKeyboard(
-          `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
-          servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
-        );
-      } else if (data.startsWith('servicio:')) {
-        const servicioSeleccionado = data.replace('servicio:', '');
+        const serv = servicios[Math.floor(Math.random() * servicios.length)];
+        const servicioSeleccionado = serv.nombre;
         const profile = await getUserProfile(chatId, kv);
         const nombreGuardado = estado.nombre || profile?.nombre;
 
-        if (nombreGuardado && estado.fecha && estado.profesional) {
+        if (!estado.profesional) {
+          await saveState({ paso: 'profesional', servicio: servicioSeleccionado });
+          await sendWithKeyboard(
+            `🎲 Te tocó *${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+            await buildProfesionalesKeyboard()
+          );
+        } else if (nombreGuardado && estado.fecha) {
+          await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado, nombre: nombreGuardado });
+          const view = await buildHorariosView(estado.fecha, servicioSeleccionado, estado.profesional!, estado.rescheduleId);
+          await sendWithKeyboard(`🎲 Te tocó *${servicioSeleccionado}*\n\n${view.text}`, view.keyboard);
+        } else if (nombreGuardado) {
+          await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado, nombre: nombreGuardado });
+          const view = await buildFechasView(servicioSeleccionado, estado.profesional);
+          await sendWithKeyboard(
+            `🎲 Te tocó *${servicioSeleccionado}*\n\nHola *${nombreGuardado}* 👋\n\n${view.text}`,
+            view.keyboard
+          );
+        } else {
+          await saveState({ ...estado, paso: 'nombre', servicio: servicioSeleccionado });
+          await sendWithKeyboard(
+            `🎲 Te tocó *${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`,
+            FLOW_CANCEL_KEYBOARD
+          );
+        }
+
+      } else if (data.startsWith('profesional:')) {
+        const profSeleccionado = data.replace('profesional:', '');
+
+        // Si ya tenía servicio (vino desde catálogo), saltear ese paso
+        if (estado.servicio) {
+          const profile = await getUserProfile(chatId, kv);
+          const nombreGuardado = estado.nombre || profile?.nombre;
+          if (nombreGuardado) {
+            await saveState({
+              ...estado,
+              paso: 'fecha',
+              profesional: profSeleccionado,
+              nombre: nombreGuardado,
+            });
+            const view = await buildFechasView(estado.servicio, profSeleccionado);
+            await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\nHola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
+          } else {
+            await saveState({ ...estado, paso: 'nombre', profesional: profSeleccionado });
+            await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
+          }
+        } else {
+          await saveState({ ...estado, paso: 'servicio', profesional: profSeleccionado });
+          await sendWithKeyboard(
+            `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
+            await buildServiciosKeyboard(true)
+          );
+        }
+
+      } else if (data.startsWith('reservar_servicio:') || data.startsWith('servicio:')) {
+        const servicioSeleccionado = data.startsWith('reservar_servicio:')
+          ? data.replace('reservar_servicio:', '')
+          : data.replace('servicio:', '');
+        const profile = await getUserProfile(chatId, kv);
+        const nombreGuardado = estado.nombre || profile?.nombre;
+
+        // Desde catálogo sin profesional: pedir profesional con servicio preseleccionado
+        if (!estado.profesional && !estado.paso) {
+          const limitReached = await checkReservationLimit(chatId);
+          if (limitReached) {
+            await sendWithKeyboard(
+              '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos. Cancelá uno desde Mis reservas.',
+              [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
+            );
+          } else {
+            await saveState({ paso: 'profesional', servicio: servicioSeleccionado });
+            await sendWithKeyboard(
+              `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+              await buildProfesionalesKeyboard()
+            );
+          }
+        } else if (!estado.profesional) {
+          await saveState({ ...estado, paso: 'profesional', servicio: servicioSeleccionado });
+          await sendWithKeyboard(
+            `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+            await buildProfesionalesKeyboard()
+          );
+        } else if (nombreGuardado && estado.fecha) {
           await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado, nombre: nombreGuardado });
           const view = await buildHorariosView(
             estado.fecha,
@@ -1290,7 +1424,7 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(`Hola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
         } else {
           await saveState({ ...estado, paso: 'nombre', servicio: servicioSeleccionado });
-          await sendWithKeyboard(`*${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`);
+          await sendWithKeyboard(`*${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
         }
 
       } else if (data === 'cambiar_fecha') {
@@ -1543,18 +1677,30 @@ export async function POST(request: NextRequest) {
       let aiResult = await resolveTextIntent(text, estado, chatId);
 
       if (aiResult.intent.action === 'consulta') {
-        await clearState();
-        if (aiResult.responseText?.trim()) {
-          await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
+        // Si hay un flujo activo, NO lo interrumpas: respondé y mantené el contexto
+        if (estado?.paso) {
+          const contextKeyboard = await getContextualKeyboard(estado);
+          const answer = aiResult.responseText?.trim()
+            || 'Dale, te cuento: es para dejar la reserva a tu nombre.';
+          const nudge =
+            estado.paso === 'nombre'
+              ? '\n\nCuando puedas, escribí tu nombre para seguir.'
+              : '\n\nSeguimos con la reserva cuando quieras.';
+          await sendWithKeyboard(answer + nudge, contextKeyboard);
         } else {
-          const consultaInfo = parseInfoQuery(text);
-          if (consultaInfo) {
-            await showInfoResponse(consultaInfo);
+          await clearState();
+          if (aiResult.responseText?.trim()) {
+            await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
           } else {
-            await sendWithKeyboard(
-              'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
-              ASSIST_KEYBOARD
-            );
+            const consultaInfo = parseInfoQuery(text);
+            if (consultaInfo) {
+              await showInfoResponse(consultaInfo);
+            } else {
+              await sendWithKeyboard(
+                'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
+                ASSIST_KEYBOARD
+              );
+            }
           }
         }
       } else if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
@@ -1562,18 +1708,16 @@ export async function POST(request: NextRequest) {
           await clearState();
           await showMainMenu(aiResult.responseText?.trim());
         } else if (aiResult.intent.action === 'servicios') {
-          const servicios = await getServiciosList();
           await sendWithKeyboard(
             aiResult.responseText?.trim() ||
-              '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*',
-            servicios.map(s => [{ text: `${s.nombre} ($${s.precio})`, callback_data: 'noop' }])
+              '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*\n\nTocá un servicio para reservarlo:',
+            await buildServiciosKeyboard(false)
           );
         } else if (aiResult.intent.action === 'profesionales') {
-          const profesionales = await getProfesionales();
           await sendWithKeyboard(
             aiResult.responseText?.trim() ||
-              '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*',
-            profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+              '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar:',
+            await buildProfesionalesKeyboard()
           );
         } else if (aiResult.intent.action === 'misreservas') {
           let reservasArray: Reservation[] = [];
@@ -1675,16 +1819,18 @@ export async function POST(request: NextRequest) {
             if (newEstado.paso === 'profesional') {
               await sendWithKeyboard(
                 aiResult.responseText?.trim() || '¿Con qué profesional te querés atender?',
-                profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }])
+                await buildProfesionalesKeyboard()
               );
             } else if (newEstado.paso === 'servicio') {
-              const servicios = await getServiciosList();
               await sendWithKeyboard(
                 `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`,
-                servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
+                await buildServiciosKeyboard(true)
               );
             } else if (newEstado.paso === 'nombre') {
-              await sendWithKeyboard(`*${newEstado.servicio}* ✔️\n\n¿Cuál es tu nombre?`);
+              await sendWithKeyboard(
+                `*${newEstado.servicio}* ✔️\n\n¿Cuál es tu nombre?`,
+                FLOW_CANCEL_KEYBOARD
+              );
             } else if (newEstado.paso === 'fecha') {
               const view = await buildFechasView(newEstado.servicio, newEstado.profesional);
               await sendWithKeyboard(`Hola *${newEstado.nombre}* 👋\n\n${view.text}`, view.keyboard);
@@ -1701,40 +1847,73 @@ export async function POST(request: NextRequest) {
 
         if (estado.paso === 'profesional') {
           const profesionales = await getProfesionales();
-          let profSeleccionado = null;
-          const num = parseInt(text);
-          if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
-            profSeleccionado = profesionales[num - 1];
+          const normalized = normalizeHumanText(text);
+          let profSeleccionado: string | null | undefined = null;
+
+          if (['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w => normalized.includes(w))) {
+            profSeleccionado = profesionales[Math.floor(Math.random() * profesionales.length)];
           } else {
-            profSeleccionado = profesionales.find(p => matchesLoosely(p, text));
+            const num = parseInt(text);
+            if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
+              profSeleccionado = profesionales[num - 1];
+            } else {
+              profSeleccionado = profesionales.find(p => matchesLoosely(p, text)) ?? null;
+            }
           }
+
           if (profSeleccionado) {
-            const servicios = await getServiciosList();
-            await saveState({ paso: 'servicio', profesional: profSeleccionado });
-            await sendWithKeyboard(
-              `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
-              servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
-            );
+            if (estado.servicio) {
+              const profile = await getUserProfile(chatId, kv);
+              const nombreGuardado = estado.nombre || profile?.nombre;
+              if (nombreGuardado) {
+                await saveState({ ...estado, paso: 'fecha', profesional: profSeleccionado, nombre: nombreGuardado });
+                const view = await buildFechasView(estado.servicio, profSeleccionado);
+                await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\nHola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
+              } else {
+                await saveState({ ...estado, paso: 'nombre', profesional: profSeleccionado });
+                await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
+              }
+            } else {
+              await saveState({ ...estado, paso: 'servicio', profesional: profSeleccionado });
+              await sendWithKeyboard(
+                `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
+                await buildServiciosKeyboard(true)
+              );
+            }
           } else {
-            await sendWithKeyboard('Elegí un profesional válido:', profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }]));
+            await sendWithKeyboard('Elegí un profesional válido:', await buildProfesionalesKeyboard());
           }
         } else if (estado.paso === 'servicio') {
           const servicios = await getServiciosList();
-          let servicioSeleccionado = null;
-          const num = parseInt(text);
-          if (!isNaN(num) && num >= 1 && num <= servicios.length) {
-            servicioSeleccionado = servicios[num - 1].nombre;
+          const normalized = normalizeHumanText(text);
+          let servicioSeleccionado: string | null | undefined = null;
+
+          if (['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w => normalized.includes(w))) {
+            servicioSeleccionado = servicios[Math.floor(Math.random() * servicios.length)].nombre;
           } else {
-            servicioSeleccionado = servicios.find(s => matchesLoosely(s.nombre, text))?.nombre;
+            const num = parseInt(text);
+            if (!isNaN(num) && num >= 1 && num <= servicios.length) {
+              servicioSeleccionado = servicios[num - 1].nombre;
+            } else {
+              servicioSeleccionado = servicios.find(s => matchesLoosely(s.nombre, text))?.nombre ?? null;
+            }
           }
 
           if (servicioSeleccionado) {
-            await saveState({ ...estado, paso: 'nombre', servicio: servicioSeleccionado });
-            await sendWithKeyboard(`*${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`);
+            const profile = await getUserProfile(chatId, kv);
+            const nombreGuardado = estado.nombre || profile?.nombre;
+            if (nombreGuardado) {
+              await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado, nombre: nombreGuardado });
+              const view = await buildFechasView(servicioSeleccionado, estado.profesional);
+              await sendWithKeyboard(`Hola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
+            } else {
+              await saveState({ ...estado, paso: 'nombre', servicio: servicioSeleccionado });
+              await sendWithKeyboard(`*${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
+            }
           } else {
             await sendWithKeyboard(
               'No reconozco ese servicio. Por favor elegí uno:',
-              servicios.map(s => [{ text: s.nombre, callback_data: `servicio:${s.nombre}` }])
+              await buildServiciosKeyboard(true)
             );
           }
 

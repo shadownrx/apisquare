@@ -41,7 +41,7 @@ const DEFAULT_CONFIG: Config = {
   },
   feriados: [],
   servicios: [
-    { nombre: 'Sesión de Quiropráctica', duracionMinutos: 25, precio: 30000 },
+    { nombre: 'Sesión de Quiropraxia', duracionMinutos: 25, precio: 30000 },
     { nombre: 'Masaje Relajante', duracionMinutos: 45, precio: 30000 },
     { nombre: 'Sesión Premium', duracionMinutos: 60, precio: 55000 }
   ]
@@ -99,6 +99,11 @@ export async function GET(request: NextRequest) {
       },
       servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
     };
+
+    config.servicios = config.servicios.map(s => ({
+      ...s,
+      nombre: s.nombre.replace(/Quiropráctica/gi, 'Quiropraxia').replace(/quiropractica/gi, 'Quiropraxia')
+    }));
 
     return NextResponse.json({ config });
   } catch (error) {

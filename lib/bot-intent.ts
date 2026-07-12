@@ -22,8 +22,8 @@ export function normalizeHumanText(text: string): string {
 }
 
 export function matchesLoosely(text: string, target: string): boolean {
-  const normalizedText = normalizeHumanText(text);
-  const normalizedTarget = normalizeHumanText(target);
+  const normalizedText = normalizeHumanText(text).replace(/quiropractica/g, 'quiropraxia');
+  const normalizedTarget = normalizeHumanText(target).replace(/quiropractica/g, 'quiropraxia');
   return normalizedText.includes(normalizedTarget) || normalizedTarget.includes(normalizedText);
 }
 
