@@ -969,7 +969,8 @@ ${clinicContext}
 REGLAS DE CLASIFICACIÓN:
 - Usuario quiere reservar un turno (aunque sea conversacional) → action: "reservar"
 - Usuario responde al paso actual del flujo de reserva → action: "reservar", shouldContinueWithFlow: true
-- Usuario solo pregunta algo sin intención de reservar → action: "consulta"
+- Usuario pide ver servicios, precios, sesiones o "mostrame los servicios" → action: "servicios" (NUNCA "consulta")
+- Usuario solo pregunta algo sin intención de reservar ni ver catálogo → action: "consulta"
 - Usuario saluda o pide menú → action: "menu"
 - Usuario menciona "mis reservas" → action: "misreservas"
 
@@ -1048,14 +1049,42 @@ async function resolveTextIntent(
   chatId: number
 ): Promise<AIResponse> {
   const aiResult = await getGroqResponse(text, estado, chatId);
+  const localIntent = parseLocalIntent(text);
   const hasAIResponse = Boolean(aiResult.responseText?.trim());
-  const hasKnownIntent = aiResult.intent.action !== 'unknown';
 
-  if (hasKnownIntent || hasAIResponse) {
+  // La UX de navegación la manda el intent local: la IA puede equivocarse en el action
+  // y dejar botones genéricos cuando el usuario pidió servicios / reservar.
+  const navActions = new Set(['servicios', 'reservar', 'misreservas', 'profesionales', 'menu']);
+  if (localIntent && navActions.has(localIntent.action)) {
+    const aiAction = aiResult.intent?.action || 'unknown';
+    const shouldOverride =
+      aiAction === 'unknown' ||
+      aiAction === 'consulta' ||
+      localIntent.action === 'servicios' ||
+      localIntent.action === 'misreservas' ||
+      localIntent.action === 'profesionales' ||
+      localIntent.action === 'menu' ||
+      (localIntent.action === 'reservar' && aiAction !== 'reservar');
+
+    if (shouldOverride) {
+      return {
+        responseText: aiResult.responseText || '',
+        intent: {
+          action: localIntent.action,
+          parameters: {
+            ...localIntent.parameters,
+            ...aiResult.intent?.parameters,
+          },
+        },
+        shouldContinueWithFlow: Boolean(aiResult.shouldContinueWithFlow && localIntent.action === 'reservar'),
+      };
+    }
+  }
+
+  if (aiResult.intent?.action !== 'unknown' || hasAIResponse) {
     return aiResult;
   }
 
-  const localIntent = parseLocalIntent(text);
   if (localIntent) {
     return { responseText: '', intent: localIntent, shouldContinueWithFlow: false };
   }
@@ -1815,10 +1844,27 @@ export async function POST(request: NextRequest) {
         } else if (infoType === 'horarios') {
           await sendWithKeyboard(await buildHorariosInfoMessage(), ASSIST_KEYBOARD);
         } else {
-          await sendWithKeyboard(await buildPreciosInfoMessage(), ASSIST_KEYBOARD);
+          // Precios = catálogo accionable: el usuario toca el servicio que quiere
+          await sendWithKeyboard(
+            (await buildPreciosInfoMessage()) + '\n\nTocá un servicio para reservarlo:',
+            await buildServiciosKeyboard(false)
+          );
         }
       };
 
+      const showServiciosCatalog = async (intro?: string) => {
+        const servicios = await getServiciosList();
+        const list = servicios
+          .map(s => `• *${s.nombre}* — ${formatPriceAR(s.precio)} (${s.duracionMinutos} min)`)
+          .join('\n');
+        const header =
+          intro?.trim() ||
+          '🩺 *Servicios disponibles*\n\n*(Atención particular, sin obra social)*';
+        await sendWithKeyboard(
+          `${header}\n\n${list}\n\nTocá uno para reservarlo:`,
+          await buildServiciosKeyboard(false)
+        );
+      };
 
       const showHorarios = async (fechaStr: string, servicio: string, profesional: string) => {
         await saveState({ ...estado, paso: 'hora', servicio, nombre: estado.nombre, fecha: fechaStr, profesional });
@@ -1841,18 +1887,23 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(answer + nudge, contextKeyboard);
         } else {
           await clearState();
-          if (aiResult.responseText?.trim()) {
-            await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
+          const consultaInfo = parseInfoQuery(text);
+          const responseText = aiResult.responseText?.trim() || '';
+          const mentionsServices =
+            /quiropraxia|masaje|premium|sesi[oó]n|servicio/i.test(responseText) &&
+            /ofrec|tenemos|disponible|precio|cuesta/i.test(responseText);
+
+          if (consultaInfo === 'precios' || mentionsServices) {
+            await showServiciosCatalog(responseText || undefined);
+          } else if (consultaInfo) {
+            await showInfoResponse(consultaInfo);
+          } else if (responseText) {
+            await sendWithKeyboard(responseText, ASSIST_KEYBOARD);
           } else {
-            const consultaInfo = parseInfoQuery(text);
-            if (consultaInfo) {
-              await showInfoResponse(consultaInfo);
-            } else {
-              await sendWithKeyboard(
-                'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
-                ASSIST_KEYBOARD
-              );
-            }
+            await sendWithKeyboard(
+              'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
+              ASSIST_KEYBOARD
+            );
           }
         }
       } else if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
@@ -1860,11 +1911,7 @@ export async function POST(request: NextRequest) {
           await clearState();
           await showMainMenu(aiResult.responseText?.trim());
         } else if (aiResult.intent.action === 'servicios') {
-          await sendWithKeyboard(
-            aiResult.responseText?.trim() ||
-              '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*\n\nTocá un servicio para reservarlo:',
-            await buildServiciosKeyboard(false)
-          );
+          await showServiciosCatalog(aiResult.responseText?.trim());
         } else if (aiResult.intent.action === 'profesionales') {
           await sendWithKeyboard(
             aiResult.responseText?.trim() ||
@@ -1979,20 +2026,31 @@ export async function POST(request: NextRequest) {
             
             // Now show the appropriate view
             if (newEstado.paso === 'profesional') {
-              await sendWithKeyboard(
-                aiResult.responseText?.trim() || '¿Con qué profesional te querés atender?',
-                await buildProfesionalesKeyboard()
-              );
+              const asksSession = /sesi[oó]n|servicio|tipo de/i.test(aiResult.responseText || '');
+              if (asksSession) {
+                // La IA preguntó por el tipo de sesión → botones de servicios, no menú genérico
+                await showServiciosCatalog(
+                  aiResult.responseText?.trim() ||
+                    '¿Qué tipo de sesión te gustaría reservar?'
+                );
+              } else {
+                await sendWithKeyboard(
+                  aiResult.responseText?.trim() || '¿Con qué profesional te querés atender?',
+                  await buildProfesionalesKeyboard()
+                );
+              }
             } else if (newEstado.paso === 'servicio') {
               await sendWithKeyboard(
-                `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`,
+                withFlowProgress(
+                  'servicio',
+                  `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`
+                ),
                 await buildServiciosKeyboard(true)
               );
             } else if (newEstado.paso === 'nombre') {
-              await sendWithKeyboard(
-                `*${newEstado.servicio}* ✔️\n\n¿Cuál es tu nombre?`,
-                FLOW_CANCEL_KEYBOARD
-              );
+              const step = await buildNombreStep(newEstado, chatId, `*${newEstado.servicio}* ✔️\n\n`);
+              await saveState(step.estado);
+              await sendWithKeyboard(step.text, step.keyboard);
             } else if (newEstado.paso === 'fecha') {
               const view = await buildFechasView(newEstado.servicio, newEstado.profesional);
               await sendWithKeyboard(`Hola *${newEstado.nombre}* 👋\n\n${view.text}`, view.keyboard);

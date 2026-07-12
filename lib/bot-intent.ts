@@ -191,6 +191,20 @@ export function isValidFlowInput(text: string, paso: string): boolean {
 export function parseLocalIntent(text: string): BotIntent | null {
   const normalized = normalizeHumanText(text);
 
+  // Catálogo / navegación primero (antes de tratarlo como "pregunta")
+  if (
+    normalized.includes('servicio') ||
+    normalized.includes('que ofrecen') ||
+    normalized.includes('que tienen') ||
+    (normalized.includes('mostr') && (normalized.includes('sesion') || normalized.includes('precio') || normalized.includes('opcion')))
+  ) {
+    return { action: 'servicios' };
+  }
+
+  if (normalized.includes('profesional')) {
+    return { action: 'profesionales' };
+  }
+
   if (parseInfoQuery(text)) {
     return { action: 'consulta' };
   }
@@ -226,14 +240,6 @@ export function parseLocalIntent(text: string): BotIntent | null {
 
   if (containsBookingIntent(text)) {
     return { action: 'reservar' };
-  }
-
-  if (normalized.includes('servicio')) {
-    return { action: 'servicios' };
-  }
-
-  if (normalized.includes('profesional')) {
-    return { action: 'profesionales' };
   }
 
   return null;
