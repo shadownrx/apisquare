@@ -85,7 +85,7 @@ export function looksLikeQuestion(text: string): boolean {
   return questionSignals.some(signal => normalized.includes(normalizeHumanText(signal)));
 }
 
-export function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'precios' | null {
+export function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'precios' | 'ubicacion' | null {
   const normalized = normalizeHumanText(text);
 
   if (
@@ -97,6 +97,19 @@ export function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'prec
     normalized.includes('medicus')
   ) {
     return 'obra_social';
+  }
+
+  if (
+    normalized.includes('donde quedan') ||
+    normalized.includes('donde estan') ||
+    normalized.includes('donde queda') ||
+    normalized.includes('ubicacion') ||
+    normalized.includes('direccion') ||
+    normalized.includes('como llego') ||
+    normalized.includes('mapa') ||
+    normalized.includes('donde es')
+  ) {
+    return 'ubicacion';
   }
 
   if (

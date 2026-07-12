@@ -18,6 +18,8 @@ import {
   capitalizeName,
   formatDateAR,
   formatPriceAR,
+  getClinicAddress,
+  getClinicMapsUrl,
   shortBookingCode,
   withFlowProgress,
 } from '@/lib/booking-copy';
@@ -924,6 +926,8 @@ async function buildClinicContextForAI(): Promise<string> {
   }
 
   context += '\nAtención particular. NO se recibe obra social.\n';
+  context += `Dirección: ${getClinicAddress()}\n`;
+  context += `Mapa: ${getClinicMapsUrl()}\n`;
   return context;
 }
 
@@ -1835,7 +1839,7 @@ export async function POST(request: NextRequest) {
         );
       };
 
-      const showInfoResponse = async (infoType: 'obra_social' | 'horarios' | 'precios') => {
+      const showInfoResponse = async (infoType: 'obra_social' | 'horarios' | 'precios' | 'ubicacion') => {
         if (infoType === 'obra_social') {
           await sendWithKeyboard(
             '🏥 *Obra social*\n\nEn este momento *no recibimos obra social*. La atención es *particular*.\n\nSi querés, puedo mostrarte servicios, horarios o ayudarte a reservar un turno.',
@@ -1843,6 +1847,11 @@ export async function POST(request: NextRequest) {
           );
         } else if (infoType === 'horarios') {
           await sendWithKeyboard(await buildHorariosInfoMessage(), ASSIST_KEYBOARD);
+        } else if (infoType === 'ubicacion') {
+          await sendWithKeyboard(
+            `📍 *Dónde estamos*\n\n${getClinicAddress()}\n\n[Ver en el mapa](${getClinicMapsUrl()})`,
+            ASSIST_KEYBOARD
+          );
         } else {
           // Precios = catálogo accionable: el usuario toca el servicio que quiere
           await sendWithKeyboard(

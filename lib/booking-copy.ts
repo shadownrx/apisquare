@@ -52,10 +52,23 @@ export function capitalizeName(nombre: string): string {
     .join(' ');
 }
 
+export function getClinicAddress(): string {
+  return (
+    process.env.CLINIC_ADDRESS?.trim() ||
+    'Bernardo de Monteagudo 328, T4000 San Miguel de Tucumán, Tucumán'
+  );
+}
+
+export function getClinicMapsUrl(): string {
+  return (
+    process.env.CLINIC_MAPS_URL?.trim() ||
+    'https://www.google.com/maps/search/?api=1&query=Bernardo+de+Monteagudo+328,+San+Miguel+de+Tucum%C3%A1n,+Tucum%C3%A1n'
+  );
+}
+
 export function getClinicFooter(): string {
-  const address = process.env.CLINIC_ADDRESS?.trim();
-  const maps = process.env.CLINIC_MAPS_URL?.trim();
-  if (!address && !maps) return '';
+  const address = getClinicAddress();
+  const maps = getClinicMapsUrl();
 
   let block = '\n📍 *Ubicación*\n';
   if (address) block += `${address}\n`;
