@@ -64,30 +64,34 @@ const RATE_LIMIT_WINDOW = 60;   // segundos
 async function checkUserRateLimit(chatId: number): Promise<boolean> {
   const now = Math.floor(Date.now() / 1000);
 
-  if (kv) {
-    const key = `ratelimit:user:${chatId}`;
-    const data = await kv.get(key) as { count: number; windowStart: number } | null;
-    if (!data) {
-      await kv.set(key, JSON.stringify({ count: 1, windowStart: now }), { ex: RATE_LIMIT_WINDOW });
-      return false; // no bloqueado
-    }
-    const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-    const elapsed = now - parsed.windowStart;
+  try {
+    if (kv) {
+      const key = `ratelimit:user:${chatId}`;
+      const data = await kv.get(key) as { count: number; windowStart: number } | null;
+      if (!data) {
+        await kv.set(key, JSON.stringify({ count: 1, windowStart: now }), { ex: RATE_LIMIT_WINDOW });
+        return false; // no bloqueado
+      }
+      const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+      const elapsed = now - (parsed.windowStart || now);
 
-    if (elapsed > RATE_LIMIT_WINDOW) {
-      // ventana nueva
-      await kv.set(key, JSON.stringify({ count: 1, windowStart: now }), { ex: RATE_LIMIT_WINDOW });
+      if (elapsed >= RATE_LIMIT_WINDOW || elapsed < 0 || !Number.isFinite(elapsed)) {
+        // ventana nueva
+        await kv.set(key, JSON.stringify({ count: 1, windowStart: now }), { ex: RATE_LIMIT_WINDOW });
+        return false;
+      }
+
+      if (parsed.count >= RATE_LIMIT_MAX) {
+        return true; // bloqueado
+      }
+
+      parsed.count += 1;
+      // Upstash rechaza ex <= 0 → siempre mínimo 1 segundo
+      const ttl = Math.max(1, RATE_LIMIT_WINDOW - elapsed);
+      await kv.set(key, JSON.stringify(parsed), { ex: ttl });
       return false;
     }
 
-    if (parsed.count >= RATE_LIMIT_MAX) {
-      return true; // bloqueado
-    }
-
-    parsed.count += 1;
-    await kv.set(key, JSON.stringify(parsed), { ex: RATE_LIMIT_WINDOW - elapsed });
-    return false;
-  } else {
     const data = localRateLimit.get(chatId);
     if (!data) {
       localRateLimit.set(chatId, { count: 1, windowStart: now });
@@ -95,7 +99,7 @@ async function checkUserRateLimit(chatId: number): Promise<boolean> {
     }
 
     const elapsed = now - data.windowStart;
-    if (elapsed > RATE_LIMIT_WINDOW) {
+    if (elapsed >= RATE_LIMIT_WINDOW) {
       localRateLimit.set(chatId, { count: 1, windowStart: now });
       return false;
     }
@@ -105,6 +109,10 @@ async function checkUserRateLimit(chatId: number): Promise<boolean> {
     }
 
     data.count += 1;
+    return false;
+  } catch (error) {
+    // Nunca tumbar el bot por un fallo de rate limit / KV
+    console.error('Rate limit check failed:', error);
     return false;
   }
 }
