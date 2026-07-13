@@ -816,13 +816,61 @@ const ASSIST_KEYBOARD = [
 
 const FLOW_CANCEL_KEYBOARD = [[BTN.CANCEL_FLOW]];
 
-async function buildProfesionalesKeyboard() {
+async function buildProfesionalesKeyboard(servicioNombre?: string) {
   const profesionales = await getProfesionales();
+  const servicios = await getServiciosList();
+  const svcIdx =
+    servicioNombre != null
+      ? servicios.findIndex(s => s.nombre === servicioNombre)
+      : -1;
+  // svc en el callback: si se pierde el estado en KV, igual recuperamos el servicio
+  const svcSuffix = svcIdx >= 0 ? `:s${svcIdx}` : '';
+
   return [
-    ...profesionales.map(p => [{ text: p, callback_data: `profesional:${p}` }]),
-    [{ text: '🎲 Al azar', callback_data: 'aleatorio_profesional' }],
+    ...profesionales.map((p, i) => [
+      { text: p, callback_data: `prof_idx:${i}${svcSuffix}` }
+    ]),
+    [{ text: '🎲 Al azar', callback_data: `aleatorio_profesional${svcSuffix}` }],
     [BTN.MENU]
   ];
+}
+
+async function resolveProfesionalFromCallback(
+  data: string
+): Promise<{ profesional: string; servicio?: string } | null> {
+  const servicios = await getServiciosList();
+  const profesionales = await getProfesionales();
+
+  // aleatorio_profesional or aleatorio_profesional:s0
+  if (data === 'aleatorio_profesional' || data.startsWith('aleatorio_profesional:')) {
+    const prof = profesionales[Math.floor(Math.random() * profesionales.length)];
+    const svcMatch = data.match(/:s(\d+)$/);
+    const servicio =
+      svcMatch && servicios[parseInt(svcMatch[1], 10)]
+        ? servicios[parseInt(svcMatch[1], 10)].nombre
+        : undefined;
+    return { profesional: prof, servicio };
+  }
+
+  // prof_idx:0 or prof_idx:0:s1
+  if (data.startsWith('prof_idx:')) {
+    const parts = data.replace('prof_idx:', '').split(':');
+    const pIdx = parseInt(parts[0] || '', 10);
+    if (Number.isNaN(pIdx) || !profesionales[pIdx]) return null;
+    let servicio: string | undefined;
+    if (parts[1]?.startsWith('s')) {
+      const sIdx = parseInt(parts[1].slice(1), 10);
+      if (!Number.isNaN(sIdx) && servicios[sIdx]) servicio = servicios[sIdx].nombre;
+    }
+    return { profesional: profesionales[pIdx], servicio };
+  }
+
+  // legacy: profesional:Nombre
+  if (data.startsWith('profesional:')) {
+    return { profesional: data.replace('profesional:', '') };
+  }
+
+  return null;
 }
 
 async function buildServiciosKeyboard(forBooking = true) {
@@ -862,21 +910,23 @@ async function continueAfterProfessional(
   prefix = ''
 ) {
   const intro = prefix || `*${profSeleccionado}* ✔️\n\n`;
+  const servicio = estado.servicio;
 
-  if (estado.servicio) {
+  if (servicio) {
     if (estado.nombre || estado.rescheduleId) {
       const nombre = estado.nombre!;
       await saveState({
         ...estado,
         paso: 'fecha',
         profesional: profSeleccionado,
+        servicio,
         nombre,
       });
-      const view = await buildFechasView(estado.servicio, profSeleccionado);
+      const view = await buildFechasView(servicio, profSeleccionado);
       await sendWithKeyboard(`${intro}Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
     } else {
       const step = await buildNombreStep(
-        { ...estado, profesional: profSeleccionado },
+        { ...estado, profesional: profSeleccionado, servicio },
         chatId,
         intro
       );
@@ -897,7 +947,7 @@ async function continueAfterProfessional(
 async function getContextualKeyboard(estado: ConversationState, _chatId?: number): Promise<any[][]> {
   switch (estado.paso) {
     case 'profesional':
-      return buildProfesionalesKeyboard();
+      return buildProfesionalesKeyboard(estado.servicio);
     case 'servicio':
       return buildServiciosKeyboard(true);
     case 'nombre':
@@ -1576,25 +1626,40 @@ export async function POST(request: NextRequest) {
           FLOW_CANCEL_KEYBOARD
         );
 
-      } else if (data === 'aleatorio_profesional') {
-        const profesionales = await getProfesionales();
-        const profSeleccionado = profesionales[Math.floor(Math.random() * profesionales.length)];
-        await continueAfterProfessional(
-          chatId,
-          estado,
-          profSeleccionado,
-          saveState,
-          sendWithKeyboard,
-          `🎲 Te tocó *${profSeleccionado}* ✔️\n\n`
-        );
+      } else if (
+        data === 'aleatorio_profesional' ||
+        data.startsWith('aleatorio_profesional:') ||
+        data.startsWith('prof_idx:') ||
+        data.startsWith('profesional:')
+      ) {
+        const resolved = await resolveProfesionalFromCallback(data);
+        if (!resolved) {
+          await sendWithKeyboard(
+            'No pude reconocer ese profesional. Elegí uno de la lista:',
+            await buildProfesionalesKeyboard(estado.servicio)
+          );
+        } else {
+          const mergedEstado: ConversationState = {
+            ...estado,
+            servicio: resolved.servicio || estado.servicio,
+          };
+          const isRandom = data.startsWith('aleatorio_profesional');
+          await continueAfterProfessional(
+            chatId,
+            mergedEstado,
+            resolved.profesional,
+            saveState,
+            sendWithKeyboard,
+            isRandom
+              ? `🎲 Te tocó *${resolved.profesional}* ✔️\n\n`
+              : `*${resolved.profesional}* ✔️\n\n`
+          );
+        }
 
       } else if (data === 'aleatorio_servicio') {
         const servicios = await getServiciosList();
         const serv = servicios[Math.floor(Math.random() * servicios.length)];
         const servicioSeleccionado = serv.nombre;
-        // Reusar el mismo handler que servicio_idx
-        const fakeData = `servicio_idx:${servicios.findIndex(s => s.nombre === servicioSeleccionado)}`;
-        // inline continue below via shared path — set and fall through by reassignment
         const profile = await getUserProfile(chatId, kv);
         const nombreGuardado = estado.nombre || profile?.nombre;
 
@@ -1602,7 +1667,7 @@ export async function POST(request: NextRequest) {
           await saveState({ ...estado, paso: 'profesional', servicio: servicioSeleccionado });
           await sendWithKeyboard(
             `🎲 Te tocó *${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
-            await buildProfesionalesKeyboard()
+            await buildProfesionalesKeyboard(servicioSeleccionado)
           );
         } else if (nombreGuardado && estado.fecha) {
           await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado, nombre: nombreGuardado });
@@ -1625,17 +1690,6 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(step.text, step.keyboard);
         }
 
-      } else if (data.startsWith('profesional:')) {
-        const profSeleccionado = data.replace('profesional:', '');
-        await continueAfterProfessional(
-          chatId,
-          estado,
-          profSeleccionado,
-          saveState,
-          sendWithKeyboard,
-          `*${profSeleccionado}* ✔️\n\n`
-        );
-
       } else if (
         data.startsWith('reservar_servicio:') ||
         data.startsWith('servicio:') ||
@@ -1653,7 +1707,7 @@ export async function POST(request: NextRequest) {
               [[BTN.MIS_RESERVAS], [BTN.MENU]]
             );
           } else {
-            // Servicio primero → pedir profesional (servicio SIEMPRE queda guardado)
+            // Servicio primero → pedir profesional (servicio va en estado Y en los botones)
             await saveState({
               ...estado,
               paso: 'profesional',
@@ -1665,7 +1719,7 @@ export async function POST(request: NextRequest) {
                 'profesional',
                 `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`
               ),
-              await buildProfesionalesKeyboard()
+              await buildProfesionalesKeyboard(servicioSeleccionado)
             );
           }
         } else if ((estado.nombre || estado.rescheduleId) && estado.fecha) {
@@ -2193,41 +2247,48 @@ export async function POST(request: NextRequest) {
 
         if (estado.paso === 'profesional') {
           const profesionales = await getProfesionales();
+          const servicios = await getServiciosList();
           const normalized = normalizeHumanText(text);
           let profSeleccionado: string | null | undefined = null;
 
-          if (['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w => normalized.includes(w))) {
-            profSeleccionado = profesionales[Math.floor(Math.random() * profesionales.length)];
+          // Si escribió un servicio en vez de profesional, tomarlo
+          const servicioTyped = servicios.find(s => matchesLoosely(s.nombre, text))?.nombre;
+          if (servicioTyped && !estado.servicio) {
+            await saveState({ ...estado, paso: 'profesional', servicio: servicioTyped });
+            await sendWithKeyboard(
+              withFlowProgress(
+                'profesional',
+                `*${servicioTyped}* ✔️\n\n¿Con qué profesional te querés atender?`
+              ),
+              await buildProfesionalesKeyboard(servicioTyped)
+            );
           } else {
-            const num = parseInt(text);
-            if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
-              profSeleccionado = profesionales[num - 1];
+            if (['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w => normalized.includes(w))) {
+              profSeleccionado = profesionales[Math.floor(Math.random() * profesionales.length)];
             } else {
-              profSeleccionado = profesionales.find(p => matchesLoosely(p, text)) ?? null;
-            }
-          }
-
-          if (profSeleccionado) {
-            if (estado.servicio) {
-              const profile = await getUserProfile(chatId, kv);
-              const nombreGuardado = estado.nombre || profile?.nombre;
-              if (nombreGuardado) {
-                await saveState({ ...estado, paso: 'fecha', profesional: profSeleccionado, nombre: nombreGuardado });
-                const view = await buildFechasView(estado.servicio, profSeleccionado);
-                await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\nHola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
+              const num = parseInt(text);
+              if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
+                profSeleccionado = profesionales[num - 1];
               } else {
-                await saveState({ ...estado, paso: 'nombre', profesional: profSeleccionado });
-                await sendWithKeyboard(`*${profSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
+                profSeleccionado = profesionales.find(p => matchesLoosely(p, text)) ?? null;
               }
+            }
+
+            if (profSeleccionado) {
+              await continueAfterProfessional(
+                chatId,
+                estado,
+                profSeleccionado,
+                saveState,
+                sendWithKeyboard,
+                `*${profSeleccionado}* ✔️\n\n`
+              );
             } else {
-              await saveState({ ...estado, paso: 'servicio', profesional: profSeleccionado });
               await sendWithKeyboard(
-                `*${profSeleccionado}* ✔️\n\n¿Qué servicio querés reservar?`,
-                await buildServiciosKeyboard(true)
+                'Elegí un profesional de la lista:',
+                await buildProfesionalesKeyboard(estado.servicio)
               );
             }
-          } else {
-            await sendWithKeyboard('Elegí un profesional válido:', await buildProfesionalesKeyboard());
           }
         } else if (estado.paso === 'servicio') {
           const servicios = await getServiciosList();
