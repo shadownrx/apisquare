@@ -90,6 +90,23 @@ export async function GET(request: NextRequest) {
     }
 
     // Merge with default to ensure all fields exist (horarios por día)
+    const readDaySlots = (
+      schedule: ProfessionalSchedule | undefined,
+      dia: number
+    ): TimeSlot[] | undefined => {
+      if (!schedule) return undefined;
+      if (Object.prototype.hasOwnProperty.call(schedule, dia)) {
+        const slots = schedule[dia];
+        return Array.isArray(slots) ? slots : undefined;
+      }
+      const asStr = String(dia);
+      if (Object.prototype.hasOwnProperty.call(schedule, asStr)) {
+        const slots = (schedule as any)[asStr];
+        return Array.isArray(slots) ? slots : undefined;
+      }
+      return undefined;
+    };
+
     const mergeSchedules = (
       defaults: Config['profesionales'],
       stored?: Config['profesionales']
@@ -99,11 +116,19 @@ export async function GET(request: NextRequest) {
       for (const name of names) {
         const base = defaults[name] || {};
         const overlay = stored?.[name];
-        if (!overlay || Object.keys(overlay).length === 0) {
-          merged[name] = { ...base };
-        } else {
-          merged[name] = { ...base, ...overlay };
+        const daySchedule: ProfessionalSchedule = {};
+        for (let dia = 0; dia <= 6; dia++) {
+          const fromOverlay = readDaySlots(overlay, dia);
+          const fromBase = readDaySlots(base, dia);
+          if (fromOverlay && fromOverlay.length > 0) {
+            daySchedule[dia] = fromOverlay;
+          } else if (fromBase && fromBase.length > 0) {
+            daySchedule[dia] = fromBase;
+          } else if (fromOverlay) {
+            daySchedule[dia] = fromOverlay;
+          }
         }
+        merged[name] = daySchedule;
       }
       return merged;
     };

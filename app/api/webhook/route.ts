@@ -170,6 +170,24 @@ const DEFAULT_CONFIG: Config = {
 
 const KV_CONFIG_KEY = 'app:config';
 
+function readDaySlots(
+  schedule: ProfessionalSchedule | undefined,
+  dia: number
+): Array<{ inicio: string; fin: string }> | undefined {
+  if (!schedule) return undefined;
+  if (Object.prototype.hasOwnProperty.call(schedule, dia)) {
+    const slots = schedule[dia];
+    return Array.isArray(slots) ? slots : undefined;
+  }
+  const asStr = String(dia);
+  if (Object.prototype.hasOwnProperty.call(schedule, asStr)) {
+    const slots = (schedule as any)[asStr];
+    return Array.isArray(slots) ? slots : undefined;
+  }
+  return undefined;
+}
+
+/** Merge día a día. Si en KV el día falta o está [], se usan los defaults (evita “no atiende miércoles”). */
 function mergeProfessionalSchedules(
   defaults: Config['profesionales'],
   stored?: Config['profesionales']
@@ -180,12 +198,22 @@ function mergeProfessionalSchedules(
   for (const name of names) {
     const base = defaults[name] || {};
     const overlay = stored?.[name];
-    // Si en KV está el profesional pero sin días, no pisar los defaults
-    if (!overlay || Object.keys(overlay).length === 0) {
-      merged[name] = { ...base };
-      continue;
+    const daySchedule: ProfessionalSchedule = {};
+
+    for (let dia = 0; dia <= 6; dia++) {
+      const fromOverlay = readDaySlots(overlay, dia);
+      const fromBase = readDaySlots(base, dia);
+
+      if (fromOverlay && fromOverlay.length > 0) {
+        daySchedule[dia] = fromOverlay;
+      } else if (fromBase && fromBase.length > 0) {
+        daySchedule[dia] = fromBase;
+      } else if (fromOverlay) {
+        daySchedule[dia] = fromOverlay; // [] explícito sin default
+      }
     }
-    merged[name] = { ...base, ...overlay };
+
+    merged[name] = daySchedule;
   }
 
   return merged;
@@ -240,13 +268,24 @@ async function getServicio(nombre: string) {
 
 async function getHorarioProfesional(profesional: string, dia: number): Promise<Array<{ inicio: string, fin: string }>> {
   const config = await getConfig();
-  const exact = config.profesionales[profesional];
-  if (exact) return exact[dia] || exact[String(dia) as any] || [];
+  let schedule = config.profesionales[profesional];
+  if (!schedule) {
+    const key = Object.keys(config.profesionales).find(p => matchesLoosely(p, profesional));
+    if (key) schedule = config.profesionales[key];
+  }
 
-  const key = Object.keys(config.profesionales).find(p => matchesLoosely(p, profesional));
-  if (!key) return [];
-  const schedule = config.profesionales[key];
-  return schedule?.[dia] || schedule?.[String(dia) as any] || [];
+  const slots = readDaySlots(schedule, dia);
+  if (slots && slots.length > 0) return slots;
+
+  // Fallback extra a defaults por si el merge no alcanzó
+  const defaultKey =
+    DEFAULT_CONFIG.profesionales[profesional]
+      ? profesional
+      : Object.keys(DEFAULT_CONFIG.profesionales).find(p => matchesLoosely(p, profesional));
+  const fallback = defaultKey ? readDaySlots(DEFAULT_CONFIG.profesionales[defaultKey], dia) : undefined;
+  if (fallback && fallback.length > 0) return fallback;
+
+  return slots || [];
 }
 
 async function isFeriado(fechaStr: string): Promise<boolean> {
