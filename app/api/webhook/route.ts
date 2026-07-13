@@ -33,6 +33,7 @@ import {
   eliminarEventoCalendar,
   verificarDisponibilidadCalendar,
 } from '@/lib/googleCalendar';
+import { extractHoraCandidates, looksLikeHoraInput, parseHoraSelection } from '@/lib/parse-hora';
 import { addDays, dayOfWeekFromFechaStr, getNowMinutesInArgentina, getToday, getTodayStr, parseFecha, toDateStr } from '@/lib/parse-fecha';
 import type { ConversationState, Reservation, StatePatch } from '@/lib/types';
 import { getUserProfile, saveUserProfile } from '@/lib/user-profile';
@@ -2290,7 +2291,8 @@ export async function POST(request: NextRequest) {
         }
       } else if (
         aiResult.intent.action !== 'unknown' &&
-        !(aiResult.shouldContinueWithFlow && estado?.paso)
+        // Si el mensaje encaja con el paso actual (ej. "15:30"), no reiniciar el flujo
+        !(estado?.paso && (aiResult.shouldContinueWithFlow || isValidFlowInput(text, estado.paso)))
       ) {
         if (aiResult.intent.action === 'menu') {
           await clearState();
@@ -2614,8 +2616,9 @@ export async function POST(request: NextRequest) {
           const normalizedPeriod = normalizeHumanText(text);
           const wantsMorning = ['manana', 'mañana', 'morning', 'por la manana', 'por la mañana', 'la manana', 'la mañana'].some(w => normalizedPeriod.includes(w));
           const wantsAfternoon = ['tarde', 'afternoon', 'por la tarde', 'la tarde'].some(w => normalizedPeriod.includes(w));
+          const mentionsConcreteTime = extractHoraCandidates(text).length > 0;
 
-          if (wantsMorning || wantsAfternoon) {
+          if ((wantsMorning || wantsAfternoon) && !mentionsConcreteTime) {
             const filtered = horariosLibres.filter(h => {
               const hour = parseInt(h.split(':')[0]);
               return wantsMorning ? hour < 13 : hour >= 13;
@@ -2639,13 +2642,31 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ status: 'ok' });
           }
 
-          const num = parseInt(text);
-          if (!isNaN(num) && num >= 1 && num <= horariosLibres.length) {
-            horaSeleccionada = horariosLibres[num - 1];
-          } else {
-            horaSeleccionada = horariosLibres.find(h =>
-              h.includes(text) || text.includes(h)
-            ) ?? null;
+          const parsedHora = parseHoraSelection(text, horariosLibres);
+
+          if (parsedHora.status === 'ambiguous') {
+            const keyboard: any[] = [];
+            for (let i = 0; i < parsedHora.candidates.length; i += 3) {
+              keyboard.push(
+                parsedHora.candidates.slice(i, i + 3).map(h => ({
+                  text: `🕐 ${h}`,
+                  callback_data: `hora:${h}`,
+                }))
+              );
+            }
+            keyboard.push([{ text: '📅 Ver todos', callback_data: 'refresh_horarios' }, BTN.MENU]);
+            await sendWithKeyboard(
+              withFlowProgress(
+                'hora',
+                `Vi más de un horario (*${parsedHora.candidates.join('*, *')}*). ¿Cuál preferís?`
+              ),
+              keyboard
+            );
+            return NextResponse.json({ status: 'ok' });
+          }
+
+          if (parsedHora.status === 'matched') {
+            horaSeleccionada = parsedHora.hora;
           }
 
           if (horaSeleccionada) {
@@ -2675,7 +2696,16 @@ export async function POST(request: NextRequest) {
               );
             }
           } else {
-            await showHorarios(estado.fecha!, estado.servicio!, estado.profesional!);
+            const view = await buildHorariosView(
+              estado.fecha!,
+              estado.servicio!,
+              estado.profesional!,
+              estado.rescheduleId
+            );
+            await sendWithKeyboard(
+              'No pude interpretar ese horario. Tocá uno de la lista o escribí por ejemplo *15:30*:',
+              view.keyboard
+            );
           }
 
         } else if (estado.paso === 'confirmar') {

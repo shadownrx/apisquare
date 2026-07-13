@@ -1,4 +1,5 @@
 import { parseFecha } from './parse-fecha';
+import { looksLikeHoraInput } from './parse-hora';
 
 export interface BotIntent {
   action: 'menu' | 'reservar' | 'misreservas' | 'servicios' | 'profesionales' | 'consulta' | 'unknown';
@@ -198,10 +199,7 @@ export function isValidFlowInput(text: string, paso: string): boolean {
     case 'fecha':
       return parseFecha(text) !== null;
     case 'hora':
-      return /^\d{1,2}(:\d{2})?$/.test(trimmed) ||
-        ['manana', 'mañana', 'tarde', 'por la manana', 'por la mañana', 'por la tarde'].some(
-          w => normalizeHumanText(trimmed).includes(normalizeHumanText(w))
-        );
+      return looksLikeHoraInput(trimmed);
     case 'profesional':
     case 'servicio':
       return trimmed.length > 0;
