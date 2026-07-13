@@ -38,7 +38,8 @@ async function readIndex(kv: KV | null, profesional: string, fecha: string): Pro
   if (kv) {
     const raw = await kv.get(key);
     if (!raw) return [];
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? (parsed as WaitlistEntry[]) : [];
   }
   return [...(localStore().get(key) || [])];
 }
@@ -103,7 +104,9 @@ export async function getWaitlistEntry(id: string): Promise<WaitlistEntry | null
   if (kv) {
     const raw = await kv.get(entryKey(id));
     if (!raw) return null;
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed as WaitlistEntry;
   }
   for (const entries of localStore().values()) {
     const found = entries.find(e => e.id === id);
