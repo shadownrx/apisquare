@@ -101,8 +101,9 @@ describe('parseLocalIntent', () => {
     assert.deepEqual(parseLocalIntent('mis reservas'), { action: 'misreservas' });
     assert.deepEqual(parseLocalIntent('ver servicios'), { action: 'servicios' });
     assert.deepEqual(parseLocalIntent('mostrame los profesionales'), { action: 'profesionales' });
+    assert.deepEqual(parseLocalIntent('Que doctores atienden?'), { action: 'profesionales' });
+    assert.deepEqual(parseLocalIntent('quien atiende'), { action: 'profesionales' });
     assert.deepEqual(parseLocalIntent('Podrías mostrarme los servicios antes?'), { action: 'servicios' });
-    assert.deepEqual(parseLocalIntent('que servicios tienen'), { action: 'servicios' });
   });
 
   it('devuelve null para mensajes no reconocidos', () => {

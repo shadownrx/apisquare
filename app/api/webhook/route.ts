@@ -1324,12 +1324,16 @@ export async function POST(request: NextRequest) {
 
       } else if (data === 'profesionales') {
         await sendWithKeyboard(
-          '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar, o elegí al azar:',
+          '👨‍⚕️ *Nuestros profesionales*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar, o elegí al azar:',
           await buildProfesionalesKeyboard()
         );
       } else if (data === 'servicios') {
+        const servicios = await getServiciosList();
+        const list = servicios
+          .map(s => `• *${s.nombre}* — ${formatPriceAR(s.precio)} (${s.duracionMinutos} min)`)
+          .join('\n');
         await sendWithKeyboard(
-          '🩺 *Servicios disponibles:*\n\n*(Atención particular, sin obra social)*\n\nTocá un servicio para reservarlo:',
+          `🩺 *Servicios disponibles*\n\n*(Atención particular, sin obra social)*\n\n${list}\n\nTocá uno para reservarlo:`,
           await buildServiciosKeyboard(false)
         );
 
@@ -1878,14 +1882,23 @@ export async function POST(request: NextRequest) {
         }
       };
 
+      const showProfesionalesCatalog = async () => {
+        await sendWithKeyboard(
+          '👨‍⚕️ *Nuestros profesionales*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar, o elegí al azar:',
+          await buildProfesionalesKeyboard()
+        );
+      };
+
       const showServiciosCatalog = async (intro?: string) => {
         const servicios = await getServiciosList();
         const list = servicios
           .map(s => `• *${s.nombre}* — ${formatPriceAR(s.precio)} (${s.duracionMinutos} min)`)
           .join('\n');
+        // Nunca mezclar intro de la IA (puede hablar de doctores): catálogo fijo
         const header =
-          intro?.trim() ||
-          '🩺 *Servicios disponibles*\n\n*(Atención particular, sin obra social)*';
+          intro && /servicio|sesi[oó]n|precio|quiropraxia|masaje|premium/i.test(intro)
+            ? intro.trim()
+            : '🩺 *Servicios disponibles*\n\n*(Atención particular, sin obra social)*';
         await sendWithKeyboard(
           `${header}\n\n${list}\n\nTocá uno para reservarlo:`,
           await buildServiciosKeyboard(false)
@@ -1898,12 +1911,24 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      // Respuestas fijas (sin IA): menú e info de la clínica → siempre el mismo formato
+      // Respuestas fijas (sin IA): menú, info y catálogos → siempre el mismo formato
       const quickLocal = parseLocalIntent(text);
       if (!estado?.paso) {
         if (quickLocal?.action === 'menu') {
           await clearState();
           await showMainMenu();
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        if (quickLocal?.action === 'profesionales') {
+          await clearState();
+          await showProfesionalesCatalog();
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        if (quickLocal?.action === 'servicios') {
+          await clearState();
+          await showServiciosCatalog();
           return NextResponse.json({ status: 'ok' });
         }
 
@@ -1934,15 +1959,19 @@ export async function POST(request: NextRequest) {
           const responseText = aiResult.responseText?.trim() || '';
           const mentionsLocation =
             /monteagudo|tucum[aá]n|ubicaci[oó]n|direcci[oó]n|mapa|d[oó]nde estamos/i.test(responseText);
+          const mentionsProfessionals =
+            /profesional|doctor|francisco|javier|chibilisco|martoni/i.test(responseText) &&
+            !/quiropraxia|masaje relajante|sesi[oó]n premium|\$\s*\d/i.test(responseText);
           const mentionsServices =
-            /quiropraxia|masaje|premium|sesi[oó]n|servicio/i.test(responseText) &&
-            /ofrec|tenemos|disponible|precio|cuesta/i.test(responseText);
+            /quiropraxia|masaje relajante|sesi[oó]n premium|precio/i.test(responseText);
 
           // Info fija siempre gana a la prosa de la IA
           if (consultaInfo === 'ubicacion' || mentionsLocation) {
             await showInfoResponse('ubicacion');
+          } else if (mentionsProfessionals) {
+            await showProfesionalesCatalog();
           } else if (consultaInfo === 'precios' || mentionsServices) {
-            await showServiciosCatalog(undefined);
+            await showServiciosCatalog();
           } else if (consultaInfo) {
             await showInfoResponse(consultaInfo);
           } else if (responseText) {
@@ -1962,13 +1991,9 @@ export async function POST(request: NextRequest) {
           await clearState();
           await showMainMenu();
         } else if (aiResult.intent.action === 'servicios') {
-          await showServiciosCatalog(aiResult.responseText?.trim());
+          await showServiciosCatalog();
         } else if (aiResult.intent.action === 'profesionales') {
-          await sendWithKeyboard(
-            aiResult.responseText?.trim() ||
-              '👨‍⚕️ *Nuestros profesionales:*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar:',
-            await buildProfesionalesKeyboard()
-          );
+          await showProfesionalesCatalog();
         } else if (aiResult.intent.action === 'misreservas') {
           let reservasArray: Reservation[] = [];
 

@@ -122,10 +122,13 @@ export function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'prec
 
   if (
     normalized.includes('horario') ||
-    normalized.includes('atienden') ||
+    normalized.includes('horarios') ||
     normalized.includes('abren') ||
     normalized.includes('cierran') ||
-    normalized.includes('cuando atiende')
+    normalized.includes('cuando atiende') ||
+    normalized.includes('cuando atienden') ||
+    normalized.includes('a que hora') ||
+    normalized.includes('en que horario')
   ) {
     return 'horarios';
   }
@@ -212,18 +215,35 @@ export function isValidFlowInput(text: string, paso: string): boolean {
 export function parseLocalIntent(text: string): BotIntent | null {
   const normalized = normalizeHumanText(text);
 
-  // Catálogo / navegación primero (antes de tratarlo como "pregunta")
+  // Profesionales / doctores primero (antes que "atienden" u otras señales)
+  if (
+    normalized.includes('profesional') ||
+    normalized.includes('doctor') ||
+    normalized.includes('doctora') ||
+    normalized.includes('doctores') ||
+    normalized.includes('medico') ||
+    normalized.includes('medicos') ||
+    normalized.includes('especialista') ||
+    normalized.includes('quiropractico') ||
+    normalized.includes('quiropraxista') ||
+    normalized.includes('quien atiende') ||
+    normalized.includes('quienes atienden') ||
+    normalized.includes('con quien') ||
+    normalized.includes('que doctores') ||
+    normalized.includes('que profesionales')
+  ) {
+    return { action: 'profesionales' };
+  }
+
+  // Catálogo de servicios (evitar "que tienen" suelto: es muy ambiguo)
   if (
     normalized.includes('servicio') ||
+    normalized.includes('sesiones') ||
     normalized.includes('que ofrecen') ||
-    normalized.includes('que tienen') ||
+    normalized.includes('tipos de sesion') ||
     (normalized.includes('mostr') && (normalized.includes('sesion') || normalized.includes('precio') || normalized.includes('opcion')))
   ) {
     return { action: 'servicios' };
-  }
-
-  if (normalized.includes('profesional')) {
-    return { action: 'profesionales' };
   }
 
   if (parseInfoQuery(text)) {
