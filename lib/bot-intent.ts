@@ -100,14 +100,22 @@ export function parseInfoQuery(text: string): 'obra_social' | 'horarios' | 'prec
   }
 
   if (
-    normalized.includes('donde quedan') ||
-    normalized.includes('donde estan') ||
-    normalized.includes('donde queda') ||
     normalized.includes('ubicacion') ||
     normalized.includes('direccion') ||
     normalized.includes('como llego') ||
+    normalized.includes('como llegar') ||
     normalized.includes('mapa') ||
-    normalized.includes('donde es')
+    normalized.includes('donde quedan') ||
+    normalized.includes('donde estan') ||
+    normalized.includes('donde queda') ||
+    normalized.includes('donde es') ||
+    normalized.includes('donde se encuentra') ||
+    normalized.includes('donde se encuentran') ||
+    normalized.includes('donde esta la') ||
+    normalized.includes('donde esta el') ||
+    normalized.includes('en que calle') ||
+    normalized.includes('ubicados') ||
+    normalized.includes('domicilio')
   ) {
     return 'ubicacion';
   }

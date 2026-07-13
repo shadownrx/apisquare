@@ -52,6 +52,13 @@ describe('parseInfoQuery', () => {
     assert.equal(parseInfoQuery('cuanto cuesta la sesion'), 'precios');
     assert.equal(parseInfoQuery('precio del masaje'), 'precios');
   });
+
+  it('detecta consultas de ubicacion', () => {
+    assert.equal(parseInfoQuery('Ubicación'), 'ubicacion');
+    assert.equal(parseInfoQuery('Donde se encuentran?'), 'ubicacion');
+    assert.equal(parseInfoQuery('donde queda la clinica'), 'ubicacion');
+    assert.equal(parseInfoQuery('como llego'), 'ubicacion');
+  });
 });
 
 describe('looksLikeQuestion', () => {

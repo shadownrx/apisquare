@@ -21,6 +21,7 @@ import {
   formatPriceAR,
   getClinicAddress,
   getClinicMapsUrl,
+  buildLocationMessage,
   shortBookingCode,
   withFlowProgress,
 } from '@/lib/booking-copy';
@@ -1867,10 +1868,7 @@ export async function POST(request: NextRequest) {
         } else if (infoType === 'horarios') {
           await sendWithKeyboard(await buildHorariosInfoMessage(), ASSIST_KEYBOARD);
         } else if (infoType === 'ubicacion') {
-          await sendWithKeyboard(
-            `📍 *Dónde estamos*\n\n${getClinicAddress()}\n\n[Ver en el mapa](${getClinicMapsUrl()})`,
-            ASSIST_KEYBOARD
-          );
+          await sendWithKeyboard(buildLocationMessage(), ASSIST_KEYBOARD);
         } else {
           // Precios = catálogo accionable: el usuario toca el servicio que quiere
           await sendWithKeyboard(
@@ -1900,12 +1898,21 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      // /start, hola, menu → saludo fijo (sin IA), siempre igual
+      // Respuestas fijas (sin IA): menú e info de la clínica → siempre el mismo formato
       const quickLocal = parseLocalIntent(text);
-      if (quickLocal?.action === 'menu' && !estado?.paso) {
-        await clearState();
-        await showMainMenu();
-        return NextResponse.json({ status: 'ok' });
+      if (!estado?.paso) {
+        if (quickLocal?.action === 'menu') {
+          await clearState();
+          await showMainMenu();
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        const infoQuery = parseInfoQuery(text);
+        if (infoQuery) {
+          await clearState();
+          await showInfoResponse(infoQuery);
+          return NextResponse.json({ status: 'ok' });
+        }
       }
 
       let aiResult = await resolveTextIntent(text, estado, chatId);
@@ -1925,12 +1932,17 @@ export async function POST(request: NextRequest) {
           await clearState();
           const consultaInfo = parseInfoQuery(text);
           const responseText = aiResult.responseText?.trim() || '';
+          const mentionsLocation =
+            /monteagudo|tucum[aá]n|ubicaci[oó]n|direcci[oó]n|mapa|d[oó]nde estamos/i.test(responseText);
           const mentionsServices =
             /quiropraxia|masaje|premium|sesi[oó]n|servicio/i.test(responseText) &&
             /ofrec|tenemos|disponible|precio|cuesta/i.test(responseText);
 
-          if (consultaInfo === 'precios' || mentionsServices) {
-            await showServiciosCatalog(responseText || undefined);
+          // Info fija siempre gana a la prosa de la IA
+          if (consultaInfo === 'ubicacion' || mentionsLocation) {
+            await showInfoResponse('ubicacion');
+          } else if (consultaInfo === 'precios' || mentionsServices) {
+            await showServiciosCatalog(undefined);
           } else if (consultaInfo) {
             await showInfoResponse(consultaInfo);
           } else if (responseText) {

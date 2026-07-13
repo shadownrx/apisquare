@@ -76,6 +76,14 @@ export function getClinicFooter(): string {
   return block;
 }
 
+export function buildLocationMessage(): string {
+  return (
+    `📍 *Dónde estamos*\n\n` +
+    `${getClinicAddress()}\n\n` +
+    `[Ver en el mapa](${getClinicMapsUrl()})`
+  );
+}
+
 export type ServiceSnapshot = {
   nombre: string;
   duracionMinutos: number;
