@@ -5,7 +5,7 @@ import { getAppointmentDate } from './googleCalendar';
 import { BTN, buildBookingCard, formatDateAR } from './booking-copy';
 import type { Reservation } from './types';
 
-async function sendTelegramReminder(chatId: number, text: string) {
+async function sendTelegramReminder(chatId: number, text: string, reservationId: string) {
   const token = process.env.TELEGRAM_TOKEN;
   if (!token) return false;
 
@@ -17,6 +17,10 @@ async function sendTelegramReminder(chatId: number, text: string) {
       disable_web_page_preview: true,
       reply_markup: {
         inline_keyboard: [
+          [
+            { text: '🔄 Cambiar turno', callback_data: `reprogramar:${reservationId}` },
+            { text: '❌ Cancelar', callback_data: `confirmar_eliminar:${reservationId}` },
+          ],
           [BTN.MIS_RESERVAS],
           [BTN.MENU],
         ],
@@ -100,7 +104,8 @@ export async function processReminders() {
         `🔔 *Recordatorio de turno*\n\n` +
           `Te recordamos que ${whenLabel} tenés tu turno:\n\n` +
           `${buildReminderCard(reservation)}\n\n` +
-          `Si necesitás cambiarlo o cancelarlo, tocá *Mis reservas*.`
+          `Si necesitás, podés *cambiar* o *cancelar* desde acá.`,
+        reservation.id
       );
 
       if (sent) {
@@ -118,7 +123,8 @@ export async function processReminders() {
         `⏰ *Tu turno es pronto*\n\n` +
           `En unos *${mins} minutos* te esperamos:\n\n` +
           `${buildReminderCard(reservation)}\n\n` +
-          `¡Nos vemos en la clínica!`
+          `¡Nos vemos en la clínica!`,
+        reservation.id
       );
 
       if (sent) {

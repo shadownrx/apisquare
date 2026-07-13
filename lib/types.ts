@@ -11,6 +11,16 @@ export interface Reservation {
   reminder1hSent?: boolean;
 }
 
+export interface WaitlistEntry {
+  id: string;
+  chatId: number;
+  profesional: string;
+  servicio: string;
+  fecha: string;
+  createdAt: number;
+  notifiedAt?: number;
+}
+
 export interface ConversationState {
   paso?: string | null;
   profesional?: string;

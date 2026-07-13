@@ -37,6 +37,7 @@ import { extractHoraCandidates, looksLikeHoraInput, parseHoraSelection } from '@
 import { addDays, dayOfWeekFromFechaStr, getNowMinutesInArgentina, getToday, getTodayStr, parseFecha, toDateStr } from '@/lib/parse-fecha';
 import type { ConversationState, Reservation, StatePatch } from '@/lib/types';
 import { getUserProfile, saveUserProfile } from '@/lib/user-profile';
+import { getWaitlistEntry, joinWaitlist, notifyWaitlistForDay } from '@/lib/waitlist';
 
 interface AIResponse {
   responseText: string;
@@ -470,6 +471,11 @@ async function buildEmptyHorariosView(
     { text: `📅 Ver ${d.label}`, callback_data: `fecha:${d.fecha}` }
   ]);
   keyboard.push([{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }]);
+  if (reason === 'ocupado' || reason === 'sin_restantes') {
+    keyboard.push([
+      { text: '🔔 Avisame si se libera', callback_data: `wl_join:${fechaStr}` },
+    ]);
+  }
   keyboard.push([BTN.MENU]);
 
   const fechaLabel = formatDate(fechaStr);
@@ -484,8 +490,8 @@ async function buildEmptyHorariosView(
     body =
       `⏰ Para *${servicio}* el ${fechaLabel} con *${profesional}* ya no quedan horarios disponibles hoy.\n\n` +
       (siguientes.length
-        ? 'Podés ver estas próximas fechas:'
-        : 'Probá con otra fecha o volvé al menú:');
+        ? 'Podés ver estas próximas fechas, o pedime que te avise si se libera algo:'
+        : 'Pedime que te avise si se libera un turno, o volvé al menú:');
   } else if (reason === 'servicio') {
     body = `⚠️ No reconocí el servicio *${servicio}*. Elegí uno de la lista:`;
     return {
@@ -496,8 +502,8 @@ async function buildEmptyHorariosView(
     body =
       `😕 No hay turnos libres para *${servicio}* el ${fechaLabel} con *${profesional}*.\n\n` +
       (siguientes.length
-        ? 'Probá con una de estas fechas disponibles:'
-        : 'Probá con otra fecha o volvé al menú:');
+        ? 'Probá con una de estas fechas, o pedime que te avise si se libera algo:'
+        : 'Pedime que te avise si se libera un turno, o volvé al menú:');
   }
 
   return {
@@ -818,6 +824,9 @@ async function reprogramarReserva(
       await kv.set(userKey, JSON.stringify(reservasArray));
     }
 
+    // El día anterior quedó con un hueco → avisar lista de espera
+    await pingWaitlist(reserva.profesional, reserva.fecha);
+
     return updatedReservation;
   } catch (error) {
     console.error('Error al reprogramar reserva:', error);
@@ -826,8 +835,10 @@ async function reprogramarReserva(
 }
 
 // Función para eliminar reserva
-async function eliminarReserva(chatId: number, reservaId: string) {
+async function eliminarReserva(chatId: number, reservaId: string): Promise<Reservation | false> {
   try {
+    let reservaEliminada: Reservation | null = null;
+
     if (kv) {
       const idKey = `reserva:id:${reservaId}`;
       const reservaData = await kv.get(idKey);
@@ -840,6 +851,7 @@ async function eliminarReserva(chatId: number, reservaId: string) {
         return false;
       }
 
+      reservaEliminada = reserva;
       await eliminarEventoCalendar(reserva.calendarEventId);
 
       await kv.del(reservaKey(reserva.profesional, reserva.fecha, reserva.hora));
@@ -854,16 +866,27 @@ async function eliminarReserva(chatId: number, reservaId: string) {
       const localReservations = getLocalReservations();
       const index = localReservations.findIndex(r => r.id === reservaId && r.chatId === chatId);
       if (index !== -1) {
+        reservaEliminada = localReservations[index];
         localReservations.splice(index, 1);
       } else {
         return false;
       }
     }
 
-    return true;
+    return reservaEliminada || false;
   } catch (error) {
     console.error('Error al eliminar reserva:', error);
     return false;
+  }
+}
+
+async function pingWaitlist(profesional: string, fecha: string) {
+  try {
+    await notifyWaitlistForDay(profesional, fecha, (servicio) =>
+      obtenerHorariosLibres(fecha, profesional, servicio)
+    );
+  } catch (error) {
+    console.error('Error notificando lista de espera:', error);
   }
 }
 
@@ -1754,14 +1777,12 @@ export async function POST(request: NextRequest) {
 
       } else if (data.startsWith('eliminar:')) {
         const reservaId = data.replace('eliminar:', '');
-        const reservaAntes = await getReservaById(chatId, reservaId);
         const eliminado = await eliminarReserva(chatId, reservaId);
 
         if (eliminado) {
+          await pingWaitlist(eliminado.profesional, eliminado.fecha);
           await sendWithKeyboard(
-            reservaAntes
-              ? `✅ Turno cancelado\n\n📅 ${formatDate(reservaAntes.fecha)} · ${reservaAntes.hora}\n🩺 ${reservaAntes.servicio} con ${reservaAntes.profesional}`
-              : '✅ Reserva eliminada correctamente.',
+            `✅ Turno cancelado\n\n📅 ${formatDate(eliminado.fecha)} · ${eliminado.hora}\n🩺 ${eliminado.servicio} con ${eliminado.profesional}`,
             [
               [BTN.MIS_RESERVAS],
               [BTN.MENU]
@@ -1771,6 +1792,71 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(
             'No se pudo eliminar la reserva.',
             [[BTN.MENU]]
+          );
+        }
+
+      } else if (data.startsWith('wl_join:')) {
+        const fecha = data.replace('wl_join:', '');
+        if (!estado.profesional || !estado.servicio || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+          await sendWithKeyboard(
+            'Para anotarte en la lista de espera necesito profesional, servicio y fecha. Empezá de nuevo:',
+            await buildProfesionalesKeyboard()
+          );
+        } else {
+          const result = await joinWaitlist({
+            chatId,
+            profesional: estado.profesional,
+            servicio: estado.servicio,
+            fecha,
+          });
+          if (!result.ok) {
+            await sendWithKeyboard(`⚠️ ${result.reason}`, [[BTN.MENU]]);
+          } else {
+            await saveState({
+              paso: 'hora',
+              profesional: estado.profesional,
+              servicio: estado.servicio,
+              fecha,
+              nombre: estado.nombre,
+            });
+            await sendWithKeyboard(
+              result.already
+                ? `🔔 Ya estabas en la lista de espera para el *${formatDate(fecha)}* con *${estado.profesional}* (*${estado.servicio}*).\n\nTe aviso si se libera un turno.`
+                : `🔔 *Lista de espera*\n\nTe anoté para el *${formatDate(fecha)}* con *${estado.profesional}* (*${estado.servicio}*).\n\nSi se libera un turno, te aviso por acá.`,
+              [
+                [{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }],
+                [BTN.MENU],
+              ]
+            );
+          }
+        }
+
+      } else if (data.startsWith('wl_open:')) {
+        const entryId = data.replace('wl_open:', '');
+        const entry = await getWaitlistEntry(entryId);
+        if (!entry || entry.chatId !== chatId) {
+          await sendWithKeyboard('Ese aviso ya no está disponible. ¿Querés reservar de nuevo?', [
+            [BTN.RESERVAR],
+            [BTN.MENU],
+          ]);
+        } else {
+          const profile = await getUserProfile(chatId, kv);
+          await saveState({
+            paso: 'hora',
+            profesional: entry.profesional,
+            servicio: entry.servicio,
+            fecha: entry.fecha,
+            nombre: profile?.nombre || estado.nombre,
+            clear: ['hora', 'rescheduleId'],
+          });
+          const view = await buildHorariosView(
+            entry.fecha,
+            entry.servicio,
+            entry.profesional
+          );
+          await sendWithKeyboard(
+            `Perfecto — estos son los horarios libres:\n\n${view.text}`,
+            view.keyboard
           );
         }
 
