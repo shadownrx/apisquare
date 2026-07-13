@@ -4,6 +4,7 @@ import { createClient } from '@vercel/kv';
 import { getLocalReservations, addLocalReservation } from '../admin/reservations/route';
 import {
   BotIntent,
+  containsBookingIntent,
   isValidFlowInput,
   isValidPersonName,
   matchesLoosely,
@@ -964,8 +965,11 @@ async function getGroqResponse(
 - Fecha: ${estado.fecha || 'no elegida'}
 - Hora: ${estado.hora || 'no elegida'}
 - Reprogramando: ${estado.rescheduleId ? 'sí' : 'no'}
-Si el mensaje responde al paso actual → shouldContinueWithFlow: true, action: "reservar", extraé el parámetro.` : '';
-
+Si el mensaje responde al paso actual → shouldContinueWithFlow: true, action: "reservar", extraé el parámetro.
+Si NO hay respuesta al paso → shouldContinueWithFlow: false.` : `
+NO hay flujo de reserva activo.
+shouldContinueWithFlow DEBE ser false.
+Si pide turno/cita → action: "reservar".`;
   const systemPrompt = `Sos el asistente virtual de una clínica de quiropraxia y masajes en Argentina (2026).
 Tu rol es ENTENDER el mensaje, responder con calidez y CLASIFICAR la intención correctamente.
 
@@ -1063,6 +1067,12 @@ async function resolveTextIntent(
   const aiResult = await getGroqResponse(text, estado, chatId);
   const localIntent = parseLocalIntent(text);
   const hasAIResponse = Boolean(aiResult.responseText?.trim());
+  const hasActiveFlow = Boolean(estado?.paso);
+
+  // Sin flujo activo, NUNCA continuar flujo — evita saltar el inicio de reserva
+  if (!hasActiveFlow) {
+    aiResult.shouldContinueWithFlow = false;
+  }
 
   // La UX de navegación la manda el intent local: la IA puede equivocarse en el action
   // y dejar botones genéricos cuando el usuario pidió servicios / reservar.
@@ -1078,7 +1088,7 @@ async function resolveTextIntent(
       localIntent.action === 'menu' ||
       (localIntent.action === 'reservar' && aiAction !== 'reservar');
 
-    if (shouldOverride) {
+    if (shouldOverride || localIntent.action === 'reservar') {
       return {
         responseText: aiResult.responseText || '',
         intent: {
@@ -1088,13 +1098,19 @@ async function resolveTextIntent(
             ...aiResult.intent?.parameters,
           },
         },
-        shouldContinueWithFlow: Boolean(aiResult.shouldContinueWithFlow && localIntent.action === 'reservar'),
+        // Solo continuar flujo si hay paso activo de verdad
+        shouldContinueWithFlow: Boolean(
+          hasActiveFlow && aiResult.shouldContinueWithFlow && localIntent.action === 'reservar'
+        ),
       };
     }
   }
 
   if (aiResult.intent?.action !== 'unknown' || hasAIResponse) {
-    return aiResult;
+    return {
+      ...aiResult,
+      shouldContinueWithFlow: Boolean(hasActiveFlow && aiResult.shouldContinueWithFlow),
+    };
   }
 
   if (localIntent) {
@@ -1923,7 +1939,10 @@ export async function POST(request: NextRequest) {
             );
           }
         }
-      } else if (aiResult.intent.action !== 'unknown' && !aiResult.shouldContinueWithFlow) {
+      } else if (
+        aiResult.intent.action !== 'unknown' &&
+        !(aiResult.shouldContinueWithFlow && estado?.paso)
+      ) {
         if (aiResult.intent.action === 'menu') {
           await clearState();
           await showMainMenu(aiResult.responseText?.trim());
@@ -2041,29 +2060,24 @@ export async function POST(request: NextRequest) {
             
             await saveState(newEstado);
             
-            // Now show the appropriate view
-            if (newEstado.paso === 'profesional') {
-              const asksSession = /sesi[oó]n|servicio|tipo de/i.test(aiResult.responseText || '');
-              if (asksSession) {
-                // La IA preguntó por el tipo de sesión → botones de servicios, no menú genérico
-                await showServiciosCatalog(
-                  aiResult.responseText?.trim() ||
-                    '¿Qué tipo de sesión te gustaría reservar?'
+            // Al pedir turno: siempre botones de servicio (no menú genérico)
+            if (newEstado.paso === 'profesional' || newEstado.paso === 'servicio') {
+              if (newEstado.profesional && newEstado.paso === 'servicio') {
+                await sendWithKeyboard(
+                  withFlowProgress(
+                    'servicio',
+                    aiResult.responseText?.trim() ||
+                      `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`
+                  ),
+                  await buildServiciosKeyboard(true)
                 );
               } else {
-                await sendWithKeyboard(
-                  aiResult.responseText?.trim() || '¿Con qué profesional te querés atender?',
-                  await buildProfesionalesKeyboard()
+                await saveState({ ...newEstado, paso: 'profesional' });
+                await showServiciosCatalog(
+                  aiResult.responseText?.trim() ||
+                    '¡Dale! Elegí el tipo de sesión y te armo el turno:'
                 );
               }
-            } else if (newEstado.paso === 'servicio') {
-              await sendWithKeyboard(
-                withFlowProgress(
-                  'servicio',
-                  `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`
-                ),
-                await buildServiciosKeyboard(true)
-              );
             } else if (newEstado.paso === 'nombre') {
               const step = await buildNombreStep(newEstado, chatId, `*${newEstado.servicio}* ✔️\n\n`);
               await saveState(step.estado);
@@ -2327,6 +2341,13 @@ export async function POST(request: NextRequest) {
           // Hay un flujo activo: no limpiar el estado, mostrar botones contextuales
           const contextKeyboard = await getContextualKeyboard(estado);
           await sendWithKeyboard(aiResult.responseText, contextKeyboard);
+        } else if (containsBookingIntent(text) || /turno|cita|reserv/i.test(aiResult.responseText)) {
+          // Pedido de turno mal clasificado → arrancar con servicios, nunca menú genérico
+          await saveState({ paso: 'profesional' });
+          await showServiciosCatalog(
+            aiResult.responseText.trim() ||
+              '¡Dale! Elegí el tipo de sesión y te armo el turno:'
+          );
         } else {
           await clearState();
           await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
