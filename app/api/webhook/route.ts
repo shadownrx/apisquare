@@ -7,6 +7,7 @@ import {
   containsBookingIntent,
   isValidFlowInput,
   isValidPersonName,
+  looksLikeQuestion,
   matchesLoosely,
   normalizeHumanText,
   parseInfoQuery,
@@ -1882,10 +1883,36 @@ export async function POST(request: NextRequest) {
         }
       };
 
-      const showProfesionalesCatalog = async () => {
+      const showProfesionalesCatalog = async (mode: 'info' | 'booking' = 'info') => {
+        const profesionales = await getProfesionales();
+
+        if (mode === 'info') {
+          // Solo información: no empujar a reservar
+          const list = profesionales.map(p => `• *${p}*`).join('\n');
+          await sendWithKeyboard(
+            `👨‍⚕️ *Nuestros profesionales*\n\n${list}\n\n*(Atención particular, sin obra social)*`,
+            ASSIST_KEYBOARD
+          );
+          return;
+        }
+
         await sendWithKeyboard(
           '👨‍⚕️ *Nuestros profesionales*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar, o elegí al azar:',
           await buildProfesionalesKeyboard()
+        );
+      };
+
+      const isProfessionalsQuestion = (msg: string) => {
+        const n = normalizeHumanText(msg);
+        return (
+          looksLikeQuestion(msg) ||
+          n.includes('quien') ||
+          n.includes('quienes') ||
+          n.includes('que doctor') ||
+          n.includes('que profesional') ||
+          n.includes('que medico') ||
+          n.includes('atienden') ||
+          n.includes('atiende')
         );
       };
 
@@ -1922,7 +1949,7 @@ export async function POST(request: NextRequest) {
 
         if (quickLocal?.action === 'profesionales') {
           await clearState();
-          await showProfesionalesCatalog();
+          await showProfesionalesCatalog(isProfessionalsQuestion(text) ? 'info' : 'booking');
           return NextResponse.json({ status: 'ok' });
         }
 
@@ -1969,7 +1996,7 @@ export async function POST(request: NextRequest) {
           if (consultaInfo === 'ubicacion' || mentionsLocation) {
             await showInfoResponse('ubicacion');
           } else if (mentionsProfessionals) {
-            await showProfesionalesCatalog();
+            await showProfesionalesCatalog('info');
           } else if (consultaInfo === 'precios' || mentionsServices) {
             await showServiciosCatalog();
           } else if (consultaInfo) {
@@ -1993,7 +2020,7 @@ export async function POST(request: NextRequest) {
         } else if (aiResult.intent.action === 'servicios') {
           await showServiciosCatalog();
         } else if (aiResult.intent.action === 'profesionales') {
-          await showProfesionalesCatalog();
+          await showProfesionalesCatalog(isProfessionalsQuestion(text) ? 'info' : 'booking');
         } else if (aiResult.intent.action === 'misreservas') {
           let reservasArray: Reservation[] = [];
 
