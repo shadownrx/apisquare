@@ -488,7 +488,8 @@ async function buildEmptyHorariosView(
         : 'Probá con otra fecha o volvé al menú:');
   } else if (reason === 'sin_restantes') {
     body =
-      `⏰ Para *${servicio}* el ${fechaLabel} con *${profesional}* ya no quedan horarios disponibles hoy.\n\n` +
+      `⏰ Para *${servicio}* el ${fechaLabel} con *${profesional}* ` +
+      `ya no quedan horarios *de hoy* (los turnos de la mañana ya pasaron o están tomados).\n\n` +
       (siguientes.length
         ? 'Podés ver estas próximas fechas, o pedime que te avise si se libera algo:'
         : 'Pedime que te avise si se libera un turno, o volvé al menú:');
