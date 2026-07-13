@@ -29,9 +29,9 @@ export const getCalendarClient = async () => {
 };
 
 function buildEventWindow(fechaStr: string, horaStr: string, duracionMinutos: number) {
-  const [year, month, day] = fechaStr.split('-').map(Number);
-  const [hour, minute] = horaStr.split(':').map(Number);
-  const start = new Date(year, month - 1, day, hour, minute);
+  // Argentina es UTC-3 todo el año. En Vercel (UTC) new Date(y,m,d,h,min) sería hora UTC, no local.
+  const hhmm = horaStr.length === 5 ? `${horaStr}:00` : horaStr;
+  const start = new Date(`${fechaStr}T${hhmm}-03:00`);
   const end = new Date(start.getTime() + duracionMinutos * 60 * 1000);
   return { start, end };
 }
@@ -164,7 +164,6 @@ export async function eliminarEventoCalendar(eventId?: string) {
 }
 
 export function getAppointmentDate(reservation: Pick<Reservation, 'fecha' | 'hora'>): Date {
-  const [year, month, day] = reservation.fecha.split('-').map(Number);
-  const [hour, minute] = reservation.hora.split(':').map(Number);
-  return new Date(year, month - 1, day, hour, minute);
+  const hhmm = reservation.hora.length === 5 ? `${reservation.hora}:00` : reservation.hora;
+  return new Date(`${reservation.fecha}T${hhmm}-03:00`);
 }

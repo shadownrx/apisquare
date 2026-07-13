@@ -22,6 +22,11 @@ export interface ConversationState {
   updatedAt?: number;
 }
 
+/** Campos a borrar explícitamente al guardar estado (undefined no borra). */
+export type StatePatch = ConversationState & {
+  clear?: Array<keyof ConversationState>;
+};
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;

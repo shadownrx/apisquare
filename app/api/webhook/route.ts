@@ -33,8 +33,8 @@ import {
   eliminarEventoCalendar,
   verificarDisponibilidadCalendar,
 } from '@/lib/googleCalendar';
-import { addDays, getToday, parseFecha, toDateStr } from '@/lib/parse-fecha';
-import type { ConversationState, Reservation } from '@/lib/types';
+import { addDays, dayOfWeekFromFechaStr, getNowMinutesInArgentina, getToday, getTodayStr, parseFecha, toDateStr } from '@/lib/parse-fecha';
+import type { ConversationState, Reservation, StatePatch } from '@/lib/types';
 import { getUserProfile, saveUserProfile } from '@/lib/user-profile';
 
 interface AIResponse {
@@ -168,6 +168,27 @@ const DEFAULT_CONFIG: Config = {
 
 const KV_CONFIG_KEY = 'app:config';
 
+function mergeProfessionalSchedules(
+  defaults: Config['profesionales'],
+  stored?: Config['profesionales']
+): Config['profesionales'] {
+  const names = new Set([...Object.keys(defaults), ...Object.keys(stored || {})]);
+  const merged: Config['profesionales'] = {};
+
+  for (const name of names) {
+    const base = defaults[name] || {};
+    const overlay = stored?.[name];
+    // Si en KV está el profesional pero sin días, no pisar los defaults
+    if (!overlay || Object.keys(overlay).length === 0) {
+      merged[name] = { ...base };
+      continue;
+    }
+    merged[name] = { ...base, ...overlay };
+  }
+
+  return merged;
+}
+
 async function getConfig(): Promise<Config> {
   let config: Config;
   if (kv) {
@@ -179,14 +200,11 @@ async function getConfig(): Promise<Config> {
     config = localConfig || DEFAULT_CONFIG;
   }
 
-  // Merge with default
+  // Merge with default (horarios por día, no reemplazar el profesional entero)
   config = {
     ...DEFAULT_CONFIG,
     ...config,
-    profesionales: {
-      ...DEFAULT_CONFIG.profesionales,
-      ...config.profesionales
-    },
+    profesionales: mergeProfessionalSchedules(DEFAULT_CONFIG.profesionales, config.profesionales),
     servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
   };
 
@@ -220,8 +238,13 @@ async function getServicio(nombre: string) {
 
 async function getHorarioProfesional(profesional: string, dia: number): Promise<Array<{ inicio: string, fin: string }>> {
   const config = await getConfig();
-  const profSchedule = config.profesionales[profesional];
-  return profSchedule?.[dia] || [];
+  const exact = config.profesionales[profesional];
+  if (exact) return exact[dia] || exact[String(dia) as any] || [];
+
+  const key = Object.keys(config.profesionales).find(p => matchesLoosely(p, profesional));
+  if (!key) return [];
+  const schedule = config.profesionales[key];
+  return schedule?.[dia] || schedule?.[String(dia) as any] || [];
 }
 
 async function isFeriado(fechaStr: string): Promise<boolean> {
@@ -234,11 +257,11 @@ async function esDiaLaborable(fechaStr: string, profesional?: string): Promise<b
   if (esFeriadoFlag) return false;
   
   if (!profesional) {
-    const dia = new Date(fechaStr + 'T12:00:00').getDay();
+    const dia = dayOfWeekFromFechaStr(fechaStr);
     return dia >= 1 && dia <= 6;
   }
   
-  const dia = new Date(fechaStr + 'T12:00:00').getDay();
+  const dia = dayOfWeekFromFechaStr(fechaStr);
   const horarios = await getHorarioProfesional(profesional, dia);
   return horarios.length > 0;
 }
@@ -251,12 +274,14 @@ function formatDate(fechaStr: string): string {
 async function proximosDiasLaborables(cantidad: number, profesional?: string): Promise<{ fecha: string; label: string }[]> {
   const dias: { fecha: string; label: string }[] = [];
   const today = getToday();
+  const todayStr = getTodayStr();
+  const tomorrowStr = toDateStr(addDays(today, 1));
   let offset = 0;
 
   while (dias.length < cantidad && offset < 30) {
     const candidate = addDays(today, offset);
     const candidateFechaStr = toDateStr(candidate);
-    const day = candidate.getDay();
+    const day = dayOfWeekFromFechaStr(candidateFechaStr);
     let works: boolean;
     if (profesional) {
       const esFeriadoFlag = await isFeriado(candidateFechaStr);
@@ -273,9 +298,9 @@ async function proximosDiasLaborables(cantidad: number, profesional?: string): P
     
     if (works) {
       let label: string;
-      if (offset === 0) {
+      if (candidateFechaStr === todayStr) {
         label = 'Hoy';
-      } else if (offset === 1) {
+      } else if (candidateFechaStr === tomorrowStr) {
         label = 'Mañana';
       } else {
         const weekday = candidate.toLocaleDateString('es-ES', { weekday: 'short' });
@@ -379,12 +404,17 @@ async function obtenerHorariosLibres(
   excludeReservaId?: string
 ): Promise<string[]> {
   const libres: string[] = [];
-  const dia = new Date(fechaStr + 'T12:00:00').getDay();
+  if (!profesional || !servicioNombre) return libres;
+
+  const dia = dayOfWeekFromFechaStr(fechaStr);
   const horarios = await getHorarioProfesional(profesional, dia);
   if (horarios.length === 0) return libres;
   
   const servicio = await getServicio(servicioNombre);
   if (!servicio) return libres;
+
+  const todayStr = getTodayStr();
+  const nowMinutes = fechaStr === todayStr ? getNowMinutesInArgentina() : -1;
   
   for (const horario of horarios) {
     const [hIni, mIni] = horario.inicio.split(':').map(Number);
@@ -396,6 +426,12 @@ async function obtenerHorariosLibres(
       const hStr = Math.floor(minutosActuales / 60).toString().padStart(2, '0');
       const mStr = (minutosActuales % 60).toString().padStart(2, '0');
       const horaStr = `${hStr}:${mStr}`;
+
+      // No ofrecer turnos que ya empezaron (margen 5 min de cortesía)
+      if (nowMinutes >= 0 && minutosActuales <= nowMinutes - 5) {
+        minutosActuales += servicio.duracionMinutos;
+        continue;
+      }
       
       const slotStart = minutosActuales;
       const slotEnd = minutosActuales + servicio.duracionMinutos;
@@ -411,44 +447,98 @@ async function obtenerHorariosLibres(
   return libres;
 }
 
+async function buildEmptyHorariosView(
+  fechaStr: string,
+  servicio: string,
+  profesional: string,
+  reason: 'no_atiende' | 'sin_restantes' | 'ocupado' | 'servicio',
+  excludeReservaId?: string
+) {
+  const proximas = await proximosDiasLaborables(10, profesional);
+  const siguientes: Array<{ fecha: string; label: string }> = [];
+  for (const d of proximas) {
+    if (d.fecha === fechaStr) continue;
+    const libres = await obtenerHorariosLibres(d.fecha, profesional, servicio, excludeReservaId);
+    if (libres.length > 0) {
+      siguientes.push(d);
+      if (siguientes.length >= 2) break;
+    }
+  }
+
+  const keyboard: any[] = siguientes.map(d => [
+    { text: `📅 Ver ${d.label}`, callback_data: `fecha:${d.fecha}` }
+  ]);
+  keyboard.push([{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }]);
+  keyboard.push([BTN.MENU]);
+
+  const fechaLabel = formatDate(fechaStr);
+  let body: string;
+  if (reason === 'no_atiende') {
+    body =
+      `📭 *${profesional}* no atiende el ${fechaLabel}.\n\n` +
+      (siguientes.length
+        ? 'Estas son las próximas fechas con turno:'
+        : 'Probá con otra fecha o volvé al menú:');
+  } else if (reason === 'sin_restantes') {
+    body =
+      `⏰ Para *${servicio}* el ${fechaLabel} con *${profesional}* ya no quedan horarios disponibles hoy.\n\n` +
+      (siguientes.length
+        ? 'Podés ver estas próximas fechas:'
+        : 'Probá con otra fecha o volvé al menú:');
+  } else if (reason === 'servicio') {
+    body = `⚠️ No reconocí el servicio *${servicio}*. Elegí uno de la lista:`;
+    return {
+      text: withFlowProgress('hora', body),
+      keyboard: await buildServiciosKeyboard(false),
+    };
+  } else {
+    body =
+      `😕 No hay turnos libres para *${servicio}* el ${fechaLabel} con *${profesional}*.\n\n` +
+      (siguientes.length
+        ? 'Probá con una de estas fechas disponibles:'
+        : 'Probá con otra fecha o volvé al menú:');
+  }
+
+  return {
+    text: withFlowProgress('hora', body),
+    keyboard
+  };
+}
+
 async function buildHorariosView(
   fechaStr: string,
   servicio: string,
   profesional: string,
   excludeReservaId?: string
 ) {
-  const horariosLibres = await obtenerHorariosLibres(fechaStr, profesional, servicio, excludeReservaId);
-  const serv = await getServicio(servicio);
-
-  if (horariosLibres.length === 0) {
-    // Sugerir próxima fecha con turnos
-    const proximas = await proximosDiasLaborables(10, profesional);
-    const siguientes: Array<{ fecha: string; label: string }> = [];
-    for (const d of proximas) {
-      if (d.fecha === fechaStr) continue;
-      const libres = await obtenerHorariosLibres(d.fecha, profesional, servicio, excludeReservaId);
-      if (libres.length > 0) {
-        siguientes.push(d);
-        if (siguientes.length >= 2) break;
-      }
-    }
-
-    const keyboard: any[] = siguientes.map(d => [
-      { text: `📅 Ver ${d.label}`, callback_data: `fecha:${d.fecha}` }
-    ]);
-    keyboard.push([{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }]);
-    keyboard.push([BTN.MENU]);
-
+  if (!profesional || !servicio) {
     return {
       text: withFlowProgress(
         'hora',
-        `😕 No hay turnos libres para *${servicio}* el ${formatDate(fechaStr)} con ${profesional}.\n\n` +
-          (siguientes.length
-            ? 'Probá con una de estas fechas disponibles:'
-            : 'Probá con otra fecha o volvé al menú:')
+        '⚠️ Me faltó un dato de la reserva. Empecemos de nuevo eligiendo el servicio:'
       ),
-      keyboard
+      keyboard: await buildServiciosKeyboard(false),
     };
+  }
+
+  const dia = dayOfWeekFromFechaStr(fechaStr);
+  const agenda = await getHorarioProfesional(profesional, dia);
+  const esFeriadoFlag = await isFeriado(fechaStr);
+  if (esFeriadoFlag || agenda.length === 0) {
+    return buildEmptyHorariosView(fechaStr, servicio, profesional, 'no_atiende', excludeReservaId);
+  }
+
+  const serv = await getServicio(servicio);
+  if (!serv) {
+    return buildEmptyHorariosView(fechaStr, servicio, profesional, 'servicio', excludeReservaId);
+  }
+
+  const horariosLibres = await obtenerHorariosLibres(fechaStr, profesional, servicio, excludeReservaId);
+
+  if (horariosLibres.length === 0) {
+    const reason =
+      fechaStr === getTodayStr() ? 'sin_restantes' : 'ocupado';
+    return buildEmptyHorariosView(fechaStr, servicio, profesional, reason, excludeReservaId);
   }
 
   const keyboard: any[] = [];
@@ -462,7 +552,7 @@ async function buildHorariosView(
     BTN.MENU
   ]);
 
-  const duracion = serv ? ` · ${serv.duracionMinutos} min` : '';
+  const duracion = ` · ${serv.duracionMinutos} min`;
   return {
     text: withFlowProgress(
       'hora',
@@ -519,8 +609,7 @@ async function verificarDisponibilidad(
   options?: { excludeReservaId?: string; excludeEventId?: string }
 ) {
   try {
-    const fecha = new Date(fechaStr + 'T12:00:00');
-    const dia = fecha.getDay();
+    const dia = dayOfWeekFromFechaStr(fechaStr);
 
     const esFeriadoFlag = await isFeriado(fechaStr);
     if (esFeriadoFlag) {
@@ -905,7 +994,7 @@ async function continueAfterProfessional(
   chatId: number,
   estado: ConversationState,
   profSeleccionado: string,
-  saveState: (s: ConversationState) => Promise<void>,
+  saveState: (s: StatePatch) => Promise<void>,
   sendWithKeyboard: (t: string, k?: any) => Promise<void>,
   prefix = ''
 ) {
@@ -977,7 +1066,7 @@ async function buildNombreStep(estado: ConversationState, chatId: number, prefix
 
   if (known) {
     return {
-      estado: { ...estado, paso: 'nombre', nombre: known } as ConversationState,
+      estado: { ...estado, paso: 'nombre', nombre: known } as StatePatch,
       text: withFlowProgress(
         'nombre',
         `${prefix}¿Reservo a nombre de *${known}*?`
@@ -990,8 +1079,9 @@ async function buildNombreStep(estado: ConversationState, chatId: number, prefix
     };
   }
 
+  const { nombre: _omitNombre, ...rest } = estado;
   return {
-    estado: { ...estado, paso: 'nombre', nombre: undefined } as ConversationState,
+    estado: { ...rest, paso: 'nombre', clear: ['nombre'] } as StatePatch,
     text: withFlowProgress('nombre', `${prefix}¿Cuál es tu nombre?`),
     keyboard: FLOW_CANCEL_KEYBOARD
   };
@@ -1367,8 +1457,24 @@ export async function POST(request: NextRequest) {
         return state;
       };
 
-      const saveState = async (newState: ConversationState) => {
-        const payload = { ...newState, updatedAt: Date.now() };
+      const saveState = async (patch: StatePatch) => {
+        const current = await getState();
+        const { clear, ...rest } = patch;
+        const payload: ConversationState = { ...current, updatedAt: Date.now() };
+
+        // undefined = no tocar ese campo (evita borrar profesional/servicio por accidente)
+        for (const [key, value] of Object.entries(rest)) {
+          if (value !== undefined) {
+            (payload as any)[key] = value;
+          }
+        }
+
+        if (clear?.length) {
+          for (const key of clear) {
+            delete (payload as any)[key];
+          }
+        }
+
         if (kv) {
           await kv.set(estadoKey, JSON.stringify(payload), { ex: 1800 });
         } else {
@@ -1453,7 +1559,10 @@ export async function POST(request: NextRequest) {
           );
         } else {
           // Misma UX que por texto: primero servicio, después profesional
-          await saveState({ paso: 'servicio' });
+          await saveState({
+            paso: 'servicio',
+            clear: ['profesional', 'servicio', 'nombre', 'fecha', 'hora', 'rescheduleId'],
+          });
           const servicios = await getServiciosList();
           const list = servicios
             .map(s => `• *${s.nombre}* — ${formatPriceAR(s.precio)} (${s.duracionMinutos} min)`)
@@ -1620,7 +1729,7 @@ export async function POST(request: NextRequest) {
         }
 
       } else if (data === 'cambiar_nombre') {
-        await saveState({ ...estado, paso: 'nombre', nombre: undefined });
+        await saveState({ paso: 'nombre', clear: ['nombre'] });
         await sendWithKeyboard(
           withFlowProgress('nombre', 'Dale, ¿cuál es tu nombre?'),
           FLOW_CANCEL_KEYBOARD
@@ -1707,12 +1816,11 @@ export async function POST(request: NextRequest) {
               [[BTN.MIS_RESERVAS], [BTN.MENU]]
             );
           } else {
-            // Servicio primero → pedir profesional (servicio va en estado Y en los botones)
+            // Servicio primero → pedir profesional
             await saveState({
-              ...estado,
               paso: 'profesional',
               servicio: servicioSeleccionado,
-              profesional: undefined,
+              clear: ['profesional', 'fecha', 'hora'],
             });
             await sendWithKeyboard(
               withFlowProgress(
@@ -1746,20 +1854,41 @@ export async function POST(request: NextRequest) {
         }
 
       } else if (data === 'cambiar_fecha') {
-        await saveState({
-          paso: 'fecha',
-          servicio: estado.servicio,
-          nombre: estado.nombre,
-          profesional: estado.profesional,
-          rescheduleId: estado.rescheduleId,
-        });
-        const view = await buildFechasView(estado.servicio, estado.profesional);
-        await sendWithKeyboard(view.text, view.keyboard);
+        if (!estado.servicio || !estado.profesional) {
+          await sendWithKeyboard(
+            '⚠️ Me faltó un dato. Elegí de nuevo el servicio:',
+            await buildServiciosKeyboard(false)
+          );
+        } else {
+          await saveState({
+            paso: 'fecha',
+            servicio: estado.servicio,
+            nombre: estado.nombre,
+            profesional: estado.profesional,
+            rescheduleId: estado.rescheduleId,
+            clear: ['fecha', 'hora'],
+          });
+          const view = await buildFechasView(estado.servicio, estado.profesional);
+          await sendWithKeyboard(view.text, view.keyboard);
+        }
 
       } else if (data.startsWith('fecha:')) {
         const fechaSeleccionada = data.replace('fecha:', '');
-        if (estado.servicio && estado.profesional) {
-          await saveState({ ...estado, paso: 'hora', fecha: fechaSeleccionada });
+        if (!estado.servicio || !estado.profesional) {
+          await sendWithKeyboard(
+            '⚠️ Me faltó el profesional o el servicio. Elegí el servicio:',
+            await buildServiciosKeyboard(false)
+          );
+        } else {
+          await saveState({
+            paso: 'hora',
+            fecha: fechaSeleccionada,
+            servicio: estado.servicio,
+            profesional: estado.profesional,
+            nombre: estado.nombre,
+            rescheduleId: estado.rescheduleId,
+            clear: ['hora'],
+          });
           const view = await buildHorariosView(
             fechaSeleccionada,
             estado.servicio,
@@ -2015,9 +2144,26 @@ export async function POST(request: NextRequest) {
         );
       };
 
-      const showHorarios = async (fechaStr: string, servicio: string, profesional: string) => {
-        await saveState({ ...estado, paso: 'hora', servicio, nombre: estado.nombre, fecha: fechaStr, profesional });
-        const view = await buildHorariosView(fechaStr, servicio, profesional, estado.rescheduleId);
+      const showHorarios = async (fechaStr: string, servicio?: string, profesional?: string) => {
+        const serv = servicio || estado.servicio;
+        const prof = profesional || estado.profesional;
+        if (!serv || !prof) {
+          await sendWithKeyboard(
+            '⚠️ Me faltó el profesional o el servicio. Elegí el servicio:',
+            await buildServiciosKeyboard(false)
+          );
+          return;
+        }
+        await saveState({
+          paso: 'hora',
+          servicio: serv,
+          profesional: prof,
+          nombre: estado.nombre,
+          fecha: fechaStr,
+          rescheduleId: estado.rescheduleId,
+          clear: ['hora'],
+        });
+        const view = await buildHorariosView(fechaStr, serv, prof, estado.rescheduleId);
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
@@ -2208,7 +2354,17 @@ export async function POST(request: NextRequest) {
               }
             }
             
-            await saveState(newEstado);
+            // Arranque limpio: no heredar profesional/fecha de un flujo anterior
+            await saveState({
+              paso: newEstado.paso,
+              ...(newEstado.profesional ? { profesional: newEstado.profesional } : {}),
+              ...(newEstado.servicio ? { servicio: newEstado.servicio } : {}),
+              ...(newEstado.nombre ? { nombre: newEstado.nombre } : {}),
+              ...(newEstado.fecha ? { fecha: newEstado.fecha } : {}),
+              clear: (
+                ['profesional', 'servicio', 'nombre', 'fecha', 'hora', 'rescheduleId'] as const
+              ).filter(k => newEstado[k] === undefined),
+            });
             
             // Al pedir turno: siempre botones de servicio (no menú genérico)
             if (newEstado.paso === 'profesional' || newEstado.paso === 'servicio') {
@@ -2221,8 +2377,25 @@ export async function POST(request: NextRequest) {
                   ),
                   await buildServiciosKeyboard(true)
                 );
+              } else if (newEstado.servicio && !newEstado.profesional) {
+                await saveState({
+                  paso: 'profesional',
+                  servicio: newEstado.servicio,
+                  ...(newEstado.nombre ? { nombre: newEstado.nombre } : {}),
+                  clear: ['profesional', 'fecha', 'hora', 'rescheduleId'],
+                });
+                await sendWithKeyboard(
+                  withFlowProgress(
+                    'profesional',
+                    `*${newEstado.servicio}* ✔️\n\n¿Con qué profesional te querés atender?`
+                  ),
+                  await buildProfesionalesKeyboard(newEstado.servicio)
+                );
               } else {
-                await saveState({ ...newEstado, paso: 'servicio', profesional: newEstado.profesional });
+                await saveState({
+                  paso: 'servicio',
+                  clear: ['profesional', 'servicio', 'nombre', 'fecha', 'hora', 'rescheduleId'],
+                });
                 await showServiciosCatalog(
                   '¡Dale! Elegí el tipo de sesión y te armo el turno:'
                 );
@@ -2499,7 +2672,10 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(aiResult.responseText, contextKeyboard);
         } else if (containsBookingIntent(text) || /turno|cita|reserv/i.test(aiResult.responseText)) {
           // Pedido de turno mal clasificado → arrancar con servicios, nunca menú genérico
-          await saveState({ paso: 'servicio' });
+          await saveState({
+            paso: 'servicio',
+            clear: ['profesional', 'servicio', 'nombre', 'fecha', 'hora', 'rescheduleId'],
+          });
           await showServiciosCatalog(
             '¡Dale! Elegí el tipo de sesión y te armo el turno:'
           );

@@ -1,3 +1,6 @@
+/** Zona horaria de la clínica (Argentina no tiene DST). */
+export const CLINIC_TZ = 'America/Argentina/Buenos_Aires';
+
 export function toDateStr(date: Date): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -5,9 +8,39 @@ export function toDateStr(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+/** Fecha de calendario YYYY-MM-DD en Argentina (Vercel corre en UTC). */
+export function getTodayStr(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: CLINIC_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
 export function getToday(): Date {
-  const now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const [y, m, d] = getTodayStr().split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/** Minutos desde medianoche en Argentina (para filtrar turnos ya pasados). */
+export function getNowMinutesInArgentina(): number {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: CLINIC_TZ,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const hour = Number(parts.find(p => p.type === 'hour')?.value);
+  const minute = Number(parts.find(p => p.type === 'minute')?.value);
+  return hour * 60 + minute;
+}
+
+export function dayOfWeekFromFechaStr(fechaStr: string): number {
+  const [y, m, d] = fechaStr.split('-').map(Number);
+  // Mediodía local evita bordes de DST/UTC al calcular el día de la semana
+  return new Date(y, m - 1, d, 12, 0, 0).getDay();
 }
 
 export function addDays(date: Date, days: number): Date {

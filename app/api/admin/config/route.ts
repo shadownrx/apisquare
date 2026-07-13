@@ -89,14 +89,29 @@ export async function GET(request: NextRequest) {
       config = getLocalConfig();
     }
 
-    // Merge with default to ensure all fields exist
+    // Merge with default to ensure all fields exist (horarios por día)
+    const mergeSchedules = (
+      defaults: Config['profesionales'],
+      stored?: Config['profesionales']
+    ): Config['profesionales'] => {
+      const names = new Set([...Object.keys(defaults), ...Object.keys(stored || {})]);
+      const merged: Config['profesionales'] = {};
+      for (const name of names) {
+        const base = defaults[name] || {};
+        const overlay = stored?.[name];
+        if (!overlay || Object.keys(overlay).length === 0) {
+          merged[name] = { ...base };
+        } else {
+          merged[name] = { ...base, ...overlay };
+        }
+      }
+      return merged;
+    };
+
     config = {
       ...DEFAULT_CONFIG,
       ...config,
-      profesionales: {
-        ...DEFAULT_CONFIG.profesionales,
-        ...config.profesionales
-      },
+      profesionales: mergeSchedules(DEFAULT_CONFIG.profesionales, config.profesionales),
       servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
     };
 
