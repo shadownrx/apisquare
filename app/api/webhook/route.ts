@@ -795,6 +795,18 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
 }
 
 // Groq Integration
+const WELCOME_MESSAGE =
+  '¡Hola! 👋 Soy el asistente de la clínica.\n\n' +
+  '¿En qué puedo ayudarte hoy?\n' +
+  '*(Atención particular, sin obra social)*';
+
+const MAIN_MENU_KEYBOARD = [
+  [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
+  [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
+  [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
+  [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
+];
+
 const ASSIST_KEYBOARD = [
   [BTN.RESERVAR],
   [{ text: '📋 Ver servicios', callback_data: 'servicios' }, BTN.MENU]
@@ -1307,14 +1319,7 @@ export async function POST(request: NextRequest) {
       // ── Manejar callbacks ────────────────────────────────────────────
       if (data === 'menu') {
         await clearState();
-        await sendWithKeyboard(
-          '¡Hola! 👋 Soy el asistente de la clínica.\n\n¿En qué puedo ayudarte hoy?\n*(Atención particular, sin obra social)*',
-          [
-          [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
-          [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
-          [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
-          [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
-        ]);
+        await sendWithKeyboard(WELCOME_MESSAGE, MAIN_MENU_KEYBOARD);
 
       } else if (data === 'profesionales') {
         await sendWithKeyboard(
@@ -1848,19 +1853,9 @@ export async function POST(request: NextRequest) {
         }
       };
 
-      const MAIN_MENU_KEYBOARD = [
-        [{ text: '📋 Ver profesionales', callback_data: 'profesionales' }],
-        [{ text: '📋 Ver servicios', callback_data: 'servicios' }],
-        [{ text: '📅 Reservar turno', callback_data: 'reservar' }],
-        [{ text: '📋 Mis reservas', callback_data: 'misreservas' }]
-      ];
-
-      const showMainMenu = async (intro?: string) => {
-        await sendWithKeyboard(
-          intro ||
-            '¡Hola! 👋 Soy el asistente de la clínica.\n\n¿En qué puedo ayudarte hoy?\n*(Atención particular, sin obra social)*',
-          MAIN_MENU_KEYBOARD
-        );
+      const showMainMenu = async () => {
+        // Siempre el mismo saludo: /start, Hola y Menú tienen que verse idénticos
+        await sendWithKeyboard(WELCOME_MESSAGE, MAIN_MENU_KEYBOARD);
       };
 
       const showInfoResponse = async (infoType: 'obra_social' | 'horarios' | 'precios' | 'ubicacion') => {
@@ -1905,6 +1900,14 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
+      // /start, hola, menu → saludo fijo (sin IA), siempre igual
+      const quickLocal = parseLocalIntent(text);
+      if (quickLocal?.action === 'menu' && !estado?.paso) {
+        await clearState();
+        await showMainMenu();
+        return NextResponse.json({ status: 'ok' });
+      }
+
       let aiResult = await resolveTextIntent(text, estado, chatId);
 
       if (aiResult.intent.action === 'consulta') {
@@ -1945,7 +1948,7 @@ export async function POST(request: NextRequest) {
       ) {
         if (aiResult.intent.action === 'menu') {
           await clearState();
-          await showMainMenu(aiResult.responseText?.trim());
+          await showMainMenu();
         } else if (aiResult.intent.action === 'servicios') {
           await showServiciosCatalog(aiResult.responseText?.trim());
         } else if (aiResult.intent.action === 'profesionales') {
