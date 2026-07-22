@@ -3,12 +3,21 @@ import assert from 'node:assert/strict';
 import {
   normalizeHumanText,
   containsBookingIntent,
+  isExplicitMenuCommand,
+  isGreetingOrChatReset,
+  sanitizePersonName,
   looksLikeQuestion,
   parseInfoQuery,
   parseLocalIntent,
+  getMisReservasMode,
+  isAbortBookingIntent,
   matchesLoosely,
   isValidFlowInput,
   isValidPersonName,
+  extractPersonName,
+  isMisReservasIntent,
+  isClinicScheduleQuestion,
+  extractBookingParameters,
 } from '../lib/bot-intent';
 
 describe('normalizeHumanText', () => {
@@ -21,6 +30,12 @@ describe('normalizeHumanText', () => {
     assert.equal(normalizeHumanText('¿Cuánto cuesta???'), 'cuanto cuesta?');
     assert.equal(normalizeHumanText('MENÚ'), 'menu');
   });
+
+  it('corrige typos frecuentes', () => {
+    assert.equal(normalizeHumanText('qiero un truno'), 'quiero un turno');
+    assert.equal(normalizeHumanText('nesesito turnito xfa'), 'necesito turnito por favor');
+    assert.equal(normalizeHumanText('fransisco'), 'francisco');
+  });
 });
 
 describe('containsBookingIntent', () => {
@@ -31,9 +46,43 @@ describe('containsBookingIntent', () => {
     assert.equal(containsBookingIntent('dale quiero reservar'), true);
   });
 
+  it('tolera typos y frases chapuceras', () => {
+    assert.equal(containsBookingIntent('ola kiero un truno'), true);
+    assert.equal(containsBookingIntent('anotame xfa'), true);
+    assert.equal(containsBookingIntent('hay lugar mañana?'), true);
+    assert.equal(containsBookingIntent('pasame un turnito'), true);
+    assert.equal(containsBookingIntent('me agendas?'), true);
+    assert.equal(containsBookingIntent('Tenes disponible para el 20 de julio?'), true);
+    assert.equal(containsBookingIntent('Hola, necesito un turno para el lunes 20 de julio'), true);
+  });
+
   it('no confunde saludos simples con reserva', () => {
     assert.equal(containsBookingIntent('hola'), false);
     assert.equal(containsBookingIntent('buenas'), false);
+  });
+
+  it('no trata FAQ de horarios como pedir cupos', () => {
+    assert.equal(isClinicScheduleQuestion('a partir de que hoario comienza a atender mañana?'), true);
+    assert.equal(isClinicScheduleQuestion('necesito turno mañana a las 15'), false);
+    assert.equal(parseInfoQuery('a partir de que hoario comienza a atender mañana?'), 'horarios');
+  });
+
+  it('no confunde estado del turno propio con pedir uno nuevo', () => {
+    assert.equal(containsBookingIntent('Me puedes informar cuanto falta para el turno?'), false);
+    assert.equal(containsBookingIntent('Claro, por eso ayer ya reserve un turno'), false);
+    assert.equal(isMisReservasIntent('Me puedes informar cuanto falta para el turno?'), true);
+    assert.equal(isMisReservasIntent('Claro, por eso ayer ya reserve un turno'), true);
+    assert.equal(parseLocalIntent('Me puedes informar cuanto falta para el turno?')?.action, 'misreservas');
+  });
+});
+
+describe('sanitizePersonName', () => {
+  it('acepta nombres reales y rechaza undefined/basura', () => {
+    assert.equal(sanitizePersonName('María López'), 'María López');
+    assert.equal(sanitizePersonName('undefined'), undefined);
+    assert.equal(sanitizePersonName('null'), undefined);
+    assert.equal(sanitizePersonName(''), undefined);
+    assert.equal(sanitizePersonName(undefined), undefined);
   });
 });
 
@@ -41,16 +90,19 @@ describe('parseInfoQuery', () => {
   it('detecta consultas de obra social', () => {
     assert.equal(parseInfoQuery('reciben obra social?'), 'obra_social');
     assert.equal(parseInfoQuery('aceptan OSDE'), 'obra_social');
+    assert.equal(parseInfoQuery('trabajan con prepaga?'), 'obra_social');
   });
 
   it('detecta consultas de horarios', () => {
     assert.equal(parseInfoQuery('cuales son los horarios'), 'horarios');
     assert.equal(parseInfoQuery('cuando atienden'), 'horarios');
+    assert.equal(parseInfoQuery('hasta que hora estan?'), 'horarios');
   });
 
   it('detecta consultas de precios', () => {
     assert.equal(parseInfoQuery('cuanto cuesta la sesion'), 'precios');
     assert.equal(parseInfoQuery('precio del masaje'), 'precios');
+    assert.equal(parseInfoQuery('cnto sale?'), 'precios');
   });
 
   it('detecta consultas de ubicacion', () => {
@@ -58,6 +110,58 @@ describe('parseInfoQuery', () => {
     assert.equal(parseInfoQuery('Donde se encuentran?'), 'ubicacion');
     assert.equal(parseInfoQuery('donde queda la clinica'), 'ubicacion');
     assert.equal(parseInfoQuery('como llego'), 'ubicacion');
+    assert.equal(parseInfoQuery('direcion?'), 'ubicacion');
+  });
+
+  it('detecta pago, cancelacion, que traer, estacionamiento y duracion', () => {
+    assert.equal(parseInfoQuery('formas de pago?'), 'pago');
+    assert.equal(parseInfoQuery('aceptan transferencia?'), 'pago');
+    assert.equal(parseInfoQuery('puedo pagar con mp?'), 'pago');
+    assert.equal(parseInfoQuery('como cancelo un turno?'), 'cancelacion');
+    assert.equal(parseInfoQuery('que ropa llevo?'), 'que_traer');
+    assert.equal(parseInfoQuery('hay estacionamiento?'), 'estacionamiento');
+    assert.equal(parseInfoQuery('cuanto dura la sesion?'), 'duracion');
+  });
+});
+
+describe('extractBookingParameters', () => {
+  const profesionales = ['Francisco Chibilisco', 'Javier Martoni'];
+  const servicios = [
+    { nombre: 'Quiropraxia' },
+    { nombre: 'Masaje Relajante' },
+    { nombre: 'Sesión Premium' },
+  ];
+
+  it('extrae profesional, fecha y franja de un pedido natural', () => {
+    const params = extractBookingParameters(
+      'quiero reservar con Francisco mañana a la tarde',
+      profesionales,
+      servicios
+    );
+    assert.equal(params.profesional, 'Francisco Chibilisco');
+    assert.ok(params.fecha);
+    assert.equal(params.franja, 'tarde');
+  });
+
+  it('extrae servicio por atajo', () => {
+    const params = extractBookingParameters(
+      'turno de masaje para hoy',
+      profesionales,
+      servicios
+    );
+    assert.equal(params.servicio, 'Masaje Relajante');
+    assert.ok(params.fecha);
+  });
+
+  it('tolera typos en profesional y franja', () => {
+    const params = extractBookingParameters(
+      'turno con fransisco manana x la tarde',
+      profesionales,
+      servicios
+    );
+    assert.equal(params.profesional, 'Francisco Chibilisco');
+    assert.ok(params.fecha);
+    assert.equal(params.franja, 'tarde');
   });
 });
 
@@ -78,23 +182,46 @@ describe('parseLocalIntent', () => {
     assert.deepEqual(parseLocalIntent('Quierooo turnooo'), { action: 'reservar' });
     assert.deepEqual(parseLocalIntent('necesito un turnitooo ya'), { action: 'reservar' });
     assert.deepEqual(parseLocalIntent('quiero sacar turno'), { action: 'reservar' });
+    assert.deepEqual(parseLocalIntent('Hola quiero un turno'), { action: 'reservar' });
+    assert.deepEqual(parseLocalIntent('buenas, necesito turno para mañana'), { action: 'reservar' });
+    assert.deepEqual(parseLocalIntent('ola kiero un truno'), { action: 'reservar' });
+    assert.deepEqual(parseLocalIntent('anotame xfa'), { action: 'reservar' });
   });
 
   it('responde consultas sin iniciar reserva', () => {
     assert.deepEqual(parseLocalIntent('Hola, queria saber si reciben obra social'), { action: 'consulta' });
     assert.deepEqual(parseLocalIntent('cuales son los horarios?'), { action: 'consulta' });
     assert.deepEqual(parseLocalIntent('cuanto cuesta'), { action: 'consulta' });
+    assert.deepEqual(parseLocalIntent('formas de pago'), { action: 'consulta' });
   });
 
   it('detecta menu y navegacion', () => {
     assert.deepEqual(parseLocalIntent('hola'), { action: 'menu' });
     assert.deepEqual(parseLocalIntent('cuales botones'), { action: 'menu' });
     assert.deepEqual(parseLocalIntent('/start'), { action: 'menu' });
+    assert.deepEqual(parseLocalIntent('holis'), { action: 'menu' });
+    assert.deepEqual(parseLocalIntent('Buenas, como estas?'), { action: 'menu' });
+    assert.equal(isGreetingOrChatReset('Buenas, como estas?'), true);
+    assert.equal(isExplicitMenuCommand('Buenas, como estas?'), false);
+    assert.equal(isExplicitMenuCommand('/start'), true);
+    assert.equal(isExplicitMenuCommand('reiniciar'), true);
   });
 
   it('diferencia mis reservas de pedir turno', () => {
     assert.deepEqual(parseLocalIntent('mis reservas'), { action: 'misreservas' });
     assert.deepEqual(parseLocalIntent('quiero ver mis reservas'), { action: 'misreservas' });
+    assert.deepEqual(parseLocalIntent('cuando tengo turno'), { action: 'misreservas' });
+    assert.deepEqual(parseLocalIntent('a que hora es mi turno?'), { action: 'misreservas' });
+    assert.equal(parseInfoQuery('a que hora es mi turno?'), null);
+    assert.equal(parseInfoQuery('a que hora atienden'), 'horarios');
+    assert.deepEqual(parseLocalIntent('tenés mi turno?'), { action: 'misreservas' });
+    assert.deepEqual(parseLocalIntent('ya reservé'), { action: 'misreservas' });
+    assert.deepEqual(parseLocalIntent('quiero un turno'), { action: 'reservar' });
+    assert.deepEqual(parseLocalIntent('Hola, puedo cambiar mi turno'), { action: 'misreservas' });
+    assert.equal(getMisReservasMode('Hola, puedo cambiar mi turno'), 'change');
+    assert.equal(getMisReservasMode('pasame el turno'), 'change');
+    assert.equal(getMisReservasMode('quiero cancelar mi turno'), 'cancel');
+    assert.equal(getMisReservasMode('a que hora es mi turno?'), 'status');
   });
 
   it('detecta otras acciones del menu', () => {
@@ -115,6 +242,17 @@ describe('matchesLoosely', () => {
   it('matchea nombres con errores de tipeo', () => {
     assert.equal(matchesLoosely('francisco chibi', 'Francisco Chibilisco'), true);
     assert.equal(matchesLoosely('masaje relajantee', 'Masaje Relajante'), true);
+    assert.equal(matchesLoosely('fransisco', 'Francisco Chibilisco'), true);
+  });
+});
+
+describe('isAbortBookingIntent', () => {
+  it('detecta abandono del armado de turno', () => {
+    assert.equal(isAbortBookingIntent('No voy a reservar al final'), true);
+    assert.equal(isAbortBookingIntent('No reservaré te dije'), true);
+    assert.equal(isAbortBookingIntent('mejor no'), true);
+    assert.equal(isAbortBookingIntent('cancelar'), true);
+    assert.equal(isAbortBookingIntent('Francisco'), false);
   });
 });
 
@@ -122,7 +260,9 @@ describe('isValidFlowInput', () => {
   it('acepta respuestas validas del flujo', () => {
     assert.equal(isValidFlowInput('Juan Perez', 'nombre'), true);
     assert.equal(isValidFlowInput('mañana', 'fecha'), true);
+    assert.equal(isValidFlowInput('Tienes para hoy?', 'fecha'), true);
     assert.equal(isValidFlowInput('15:30', 'hora'), true);
+    assert.equal(isValidFlowInput('No voy a reservar al final', 'profesional'), false);
     assert.equal(isValidFlowInput('Francisco Chibilisco', 'profesional'), true);
   });
 
@@ -142,5 +282,16 @@ describe('isValidFlowInput', () => {
     assert.equal(isValidPersonName('ok'), false);
     assert.equal(isValidPersonName('Juan'), true);
     assert.equal(isValidPersonName('María López'), true);
+  });
+
+  it('extrae nombre de frases naturales', () => {
+    assert.equal(extractPersonName('Salvador'), 'Salvador');
+    assert.equal(extractPersonName('Salvador es mi nombre'), 'Salvador');
+    assert.equal(extractPersonName('me llamo María López'), 'María López');
+    assert.equal(extractPersonName('soy Juan'), 'Juan');
+    assert.equal(extractPersonName('mi nombre es Ana'), 'Ana');
+    assert.equal(extractPersonName('dale'), undefined);
+    assert.equal(isValidFlowInput('Salvador es mi nombre', 'nombre'), true);
+    assert.equal(isValidFlowInput('me llamo Salvador', 'nombre'), true);
   });
 });

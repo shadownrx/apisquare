@@ -3,20 +3,51 @@ import axios from 'axios';
 import { createClient } from '@vercel/kv';
 import { getLocalReservations, addLocalReservation } from '../admin/reservations/route';
 import {
+  buildAppointmentsToolResult,
+  clearGeminiHistory,
+  runAssistantTurn,
+  type AppointmentsAction,
+  type AssistantToolHandlers,
+  type AssistantTurnResult,
+  type ClinicInfoTopic,
+} from '@/lib/assistant';
+import {
   BotIntent,
   containsBookingIntent,
+  extractBookingParameters,
+  getMisReservasMode,
+  isAbortBookingIntent,
+  isExplicitMenuCommand,
+  isGreetingOrChatReset,
+  isMisReservasIntent,
+  isClinicScheduleQuestion,
+  isTimeUntilIntent,
   isValidFlowInput,
-  isValidPersonName,
+  extractPersonName,
+  looksLikeAvailabilityQuestion,
   looksLikeQuestion,
   matchesLoosely,
   normalizeHumanText,
   parseInfoQuery,
   parseLocalIntent,
+  sanitizePersonName,
+  type InfoQueryType,
+  type MisReservasMode,
 } from '@/lib/bot-intent';
 import {
   BTN,
+  buildAvailabilityPatientMessage,
   buildBookingCard,
+  buildFaqCancelacionMessage,
+  buildFaqDuracionMessage,
+  buildFaqEstacionamientoMessage,
+  buildFaqPagoMessage,
+  buildFaqQueTraerMessage,
+  buildFeriadoMessage,
+  buildLimitReachedMessage,
+  buildRebookButton,
   buildSuccessMessage,
+  buildTurnoStatusMessage,
   capitalizeName,
   formatDateAR,
   formatPriceAR,
@@ -35,6 +66,7 @@ import {
 } from '@/lib/googleCalendar';
 import { extractHoraCandidates, looksLikeHoraInput, parseHoraSelection } from '@/lib/parse-hora';
 import { addDays, dayOfWeekFromFechaStr, getNowMinutesInArgentina, getToday, getTodayStr, parseFecha, toDateStr } from '@/lib/parse-fecha';
+import { notifyStaff } from '@/lib/staff-notify';
 import type { ConversationState, Reservation, StatePatch } from '@/lib/types';
 import { getUserProfile, saveUserProfile } from '@/lib/user-profile';
 import { getWaitlistEntry, joinWaitlist, notifyWaitlistForDay } from '@/lib/waitlist';
@@ -187,7 +219,7 @@ function readDaySlots(
   return undefined;
 }
 
-/** Merge día a día. Si en KV el día falta o está [], se usan los defaults (evita “no atiende miércoles”). */
+/** Merge día a día. Si en KV el día falta o está [], se usan los defaults. */
 function mergeProfessionalSchedules(
   defaults: Config['profesionales'],
   stored?: Config['profesionales']
@@ -207,9 +239,11 @@ function mergeProfessionalSchedules(
       if (fromOverlay && fromOverlay.length > 0) {
         daySchedule[dia] = fromOverlay;
       } else if (fromBase && fromBase.length > 0) {
+        // KV vacío o ausente → default (evita “no atiende miércoles” por [] en KV)
         daySchedule[dia] = fromBase;
       } else if (fromOverlay) {
-        daySchedule[dia] = fromOverlay; // [] explícito sin default
+        // [] explícito solo si tampoco hay default
+        daySchedule[dia] = fromOverlay;
       }
     }
 
@@ -219,32 +253,73 @@ function mergeProfessionalSchedules(
   return merged;
 }
 
+function sanitizeFeriados(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map(f => String(f).trim().slice(0, 10))
+    .filter(f => /^\d{4}-\d{2}-\d{2}$/.test(f));
+}
+
 async function getConfig(): Promise<Config> {
   let config: Config;
+  let hadStored = false;
+  let feriadosRaw: unknown = [];
   if (kv) {
     const stored = await kv.get(KV_CONFIG_KEY);
-    config = stored ? (typeof stored === 'string' ? JSON.parse(stored) : stored) : DEFAULT_CONFIG;
+    if (stored) {
+      hadStored = true;
+      config = typeof stored === 'string' ? JSON.parse(stored) : stored;
+      feriadosRaw = (config as Config).feriados;
+    } else {
+      config = DEFAULT_CONFIG;
+      feriadosRaw = DEFAULT_CONFIG.feriados;
+    }
   } else {
-    // Local config for dev
     const localConfig = (global as any)._localAppConfig;
     config = localConfig || DEFAULT_CONFIG;
+    feriadosRaw = config.feriados;
   }
 
-  // Merge with default (horarios por día, no reemplazar el profesional entero)
+  const feriadosBefore = sanitizeFeriados(feriadosRaw);
+  // 15/07/2026 no es feriado en AR; si quedó cargado por error en el admin, sacarlo
+  const feriados = feriadosBefore.filter(f => f !== '2026-07-15');
+
   config = {
     ...DEFAULT_CONFIG,
     ...config,
+    feriados,
     profesionales: mergeProfessionalSchedules(DEFAULT_CONFIG.profesionales, config.profesionales),
-    servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios
+    servicios: config.servicios && config.servicios.length > 0 ? config.servicios : DEFAULT_CONFIG.servicios,
   };
 
-  // Normalizar nombre legacy "Quiropráctica" → "Quiropraxia"
   config.servicios = config.servicios.map(s => ({
     ...s,
-    nombre: s.nombre.replace(/Quiropráctica/gi, 'Quiropraxia').replace(/quiropractica/gi, 'Quiropraxia')
+    nombre: s.nombre.replace(/Quiropráctica/gi, 'Quiropraxia').replace(/quiropractica/gi, 'Quiropraxia'),
   }));
 
+  if (kv && hadStored && feriados.length !== feriadosBefore.length) {
+    try {
+      await kv.set(
+        KV_CONFIG_KEY,
+        JSON.stringify({
+          profesionales: config.profesionales,
+          feriados: config.feriados,
+          servicios: config.servicios,
+        })
+      );
+      console.warn('[config] Feriado inválido 2026-07-15 eliminado de KV');
+    } catch (e) {
+      console.error('[config] No se pudo persistir limpieza de feriados:', e);
+    }
+  }
+
   return config;
+}
+
+async function isFeriado(fechaStr: string): Promise<boolean> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaStr)) return false;
+  const config = await getConfig();
+  return sanitizeFeriados(config.feriados).includes(fechaStr);
 }
 
 async function getProfesionales() {
@@ -277,7 +352,6 @@ async function getHorarioProfesional(profesional: string, dia: number): Promise<
   const slots = readDaySlots(schedule, dia);
   if (slots && slots.length > 0) return slots;
 
-  // Fallback extra a defaults por si el merge no alcanzó
   const defaultKey =
     DEFAULT_CONFIG.profesionales[profesional]
       ? profesional
@@ -286,11 +360,6 @@ async function getHorarioProfesional(profesional: string, dia: number): Promise<
   if (fallback && fallback.length > 0) return fallback;
 
   return slots || [];
-}
-
-async function isFeriado(fechaStr: string): Promise<boolean> {
-  const config = await getConfig();
-  return config.feriados.includes(fechaStr);
 }
 
 async function esDiaLaborable(fechaStr: string, profesional?: string): Promise<boolean> {
@@ -312,14 +381,41 @@ function formatDate(fechaStr: string): string {
   return formatDateAR(fechaStr);
 }
 
-async function proximosDiasLaborables(cantidad: number, profesional?: string): Promise<{ fecha: string; label: string }[]> {
+/** Etiqueta corta de día en zona Argentina (evita desfasajes UTC en Vercel). */
+function formatDayButtonShort(fechaStr: string): string {
+  const [y, m, d] = fechaStr.split('-').map(Number);
+  // 15:00 UTC = 12:00 en Argentina → el día de calendario no se corre
+  const instant = new Date(Date.UTC(y, m - 1, d, 15, 0, 0));
+  const weekday = new Intl.DateTimeFormat('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    weekday: 'short',
+  }).format(instant);
+  const day = new Intl.DateTimeFormat('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    day: 'numeric',
+  }).format(instant);
+  const month = new Intl.DateTimeFormat('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    month: 'short',
+  }).format(instant);
+  const wd = weekday.replace('.', '').trim();
+  const mo = month.replace('.', '').trim();
+  return `${wd.charAt(0).toUpperCase() + wd.slice(1)} ${day} ${mo.charAt(0).toUpperCase() + mo.slice(1)}`;
+}
+
+async function proximosDiasLaborables(
+  cantidad: number,
+  profesional?: string,
+  servicio?: string,
+  excludeReservaId?: string
+): Promise<{ fecha: string; label: string }[]> {
   const dias: { fecha: string; label: string }[] = [];
   const today = getToday();
   const todayStr = getTodayStr();
   const tomorrowStr = toDateStr(addDays(today, 1));
   let offset = 0;
 
-  while (dias.length < cantidad && offset < 30) {
+  while (dias.length < cantidad && offset < 45) {
     const candidate = addDays(today, offset);
     const candidateFechaStr = toDateStr(candidate);
     const day = dayOfWeekFromFechaStr(candidateFechaStr);
@@ -334,20 +430,21 @@ async function proximosDiasLaborables(cantidad: number, profesional?: string): P
       }
     } else {
       const esFeriadoFlag = await isFeriado(candidateFechaStr);
-      works = !esFeriadoFlag && (day >= 1 && day <= 6);
+      works = !esFeriadoFlag && day >= 1 && day <= 6;
     }
-    
+
     if (works) {
+      // Importante: NO filtrar por slots libres acá.
+      // Si filtramos “hoy” por horarios ya pasados (o un desfase TZ),
+      // desaparece el botón Hoy aunque el profesional atienda ese día.
+      const short = formatDayButtonShort(candidateFechaStr);
       let label: string;
       if (candidateFechaStr === todayStr) {
-        label = 'Hoy';
+        label = `Hoy · ${short}`;
       } else if (candidateFechaStr === tomorrowStr) {
-        label = 'Mañana';
+        label = `Mañana · ${short}`;
       } else {
-        const weekday = candidate.toLocaleDateString('es-ES', { weekday: 'short' });
-        const d = candidate.getDate();
-        const month = candidate.toLocaleDateString('es-ES', { month: 'short' });
-        label = `${weekday.charAt(0).toUpperCase() + weekday.slice(1)} ${d} ${month.charAt(0).toUpperCase() + month.slice(1)}`;
+        label = short;
       }
       dias.push({ fecha: candidateFechaStr, label });
     }
@@ -356,8 +453,12 @@ async function proximosDiasLaborables(cantidad: number, profesional?: string): P
   return dias;
 }
 
-async function buildFechasKeyboard(profesional?: string) {
-  const dias = await proximosDiasLaborables(8, profesional);
+async function buildFechasKeyboard(
+  profesional?: string,
+  servicio?: string,
+  excludeReservaId?: string
+) {
+  const dias = await proximosDiasLaborables(8, profesional, servicio, excludeReservaId);
   const keyboard = [];
   for (let i = 0; i < dias.length; i += 2) {
     keyboard.push(
@@ -371,13 +472,17 @@ async function buildFechasKeyboard(profesional?: string) {
   return keyboard;
 }
 
-async function buildFechasView(servicio?: string, profesional?: string) {
+async function buildFechasView(
+  servicio?: string,
+  profesional?: string,
+  excludeReservaId?: string
+) {
   const header = servicio
     ? `📅 *${servicio}*${profesional ? `\n👨‍⚕️ ${profesional}` : ''}\n\n¿Qué día preferís?`
     : '📅 ¿Qué día te gustaría?';
   return {
     text: withFlowProgress('fecha', header),
-    keyboard: await buildFechasKeyboard(profesional)
+    keyboard: await buildFechasKeyboard(profesional, servicio, excludeReservaId)
   };
 }
 
@@ -398,6 +503,25 @@ function horaAMinutos(horaStr: string): number {
 
 // Helper: chequear si un intervalo [start, end) se solapa con alguna reserva existente
 const STATE_TTL_MS = 30 * 60 * 1000;
+
+async function loadConversationState(chatId: number): Promise<ConversationState> {
+  const estadoKey = `conv:${chatId}`;
+  let state: ConversationState = { paso: null };
+
+  if (kv) {
+    const kvEstado = await kv.get(estadoKey);
+    if (kvEstado) {
+      state = typeof kvEstado === 'string' ? JSON.parse(kvEstado) : kvEstado;
+    }
+  } else {
+    state = localStorage.get(estadoKey) || { paso: null };
+  }
+
+  if (state.updatedAt && Date.now() - state.updatedAt > STATE_TTL_MS) {
+    return { paso: null };
+  }
+  return state;
+}
 
 async function haySolapamiento(
   profesional: string,
@@ -468,8 +592,9 @@ async function obtenerHorariosLibres(
       const mStr = (minutosActuales % 60).toString().padStart(2, '0');
       const horaStr = `${hStr}:${mStr}`;
 
-      // No ofrecer turnos que ya empezaron (margen 5 min de cortesía)
-      if (nowMinutes >= 0 && minutosActuales <= nowMinutes - 5) {
+      // No ofrecer turnos que ya empezaron (margen 5 min de cortesía).
+      // nowMinutes SIEMPRE es hora Argentina (UTC-3), nunca UTC del server.
+      if (nowMinutes >= 0 && minutosActuales + 5 <= nowMinutes) {
         minutosActuales += servicio.duracionMinutos;
         continue;
       }
@@ -495,7 +620,7 @@ async function buildEmptyHorariosView(
   reason: 'no_atiende' | 'sin_restantes' | 'ocupado' | 'servicio',
   excludeReservaId?: string
 ) {
-  const proximas = await proximosDiasLaborables(10, profesional);
+  const proximas = await proximosDiasLaborables(10, profesional, servicio, excludeReservaId);
   const siguientes: Array<{ fecha: string; label: string }> = [];
   for (const d of proximas) {
     if (d.fecha === fechaStr) continue;
@@ -540,9 +665,9 @@ async function buildEmptyHorariosView(
     };
   } else {
     body =
-      `😕 No hay turnos libres para *${servicio}* el ${fechaLabel} con *${profesional}*.\n\n` +
+      `😕 Ese día está *lleno* para *${servicio}* con *${profesional}* (${fechaLabel}).\n\n` +
       (siguientes.length
-        ? 'Probá con una de estas fechas, o pedime que te avise si se libera algo:'
+        ? 'Probá con una de estas fechas, o pedime que te avise si se libera un turno:'
         : 'Pedime que te avise si se libera un turno, o volvé al menú:');
   }
 
@@ -552,11 +677,23 @@ async function buildEmptyHorariosView(
   };
 }
 
+function filterHorariosByFranja(
+  horarios: string[],
+  franja?: 'manana' | 'tarde'
+): string[] {
+  if (!franja) return horarios;
+  return horarios.filter(h => {
+    const hour = parseInt(h.split(':')[0], 10);
+    return franja === 'manana' ? hour < 13 : hour >= 13;
+  });
+}
+
 async function buildHorariosView(
   fechaStr: string,
   servicio: string,
   profesional: string,
-  excludeReservaId?: string
+  excludeReservaId?: string,
+  franja?: 'manana' | 'tarde'
 ) {
   if (!profesional || !servicio) {
     return {
@@ -571,7 +708,16 @@ async function buildHorariosView(
   const dia = dayOfWeekFromFechaStr(fechaStr);
   const agenda = await getHorarioProfesional(profesional, dia);
   const esFeriadoFlag = await isFeriado(fechaStr);
-  if (esFeriadoFlag || agenda.length === 0) {
+  if (esFeriadoFlag) {
+    return {
+      text: withFlowProgress('hora', buildFeriadoMessage(formatDate(fechaStr))),
+      keyboard: [
+        [{ text: '📅 Otra fecha', callback_data: 'cambiar_fecha' }],
+        [BTN.MENU],
+      ],
+    };
+  }
+  if (agenda.length === 0) {
     return buildEmptyHorariosView(fechaStr, servicio, profesional, 'no_atiende', excludeReservaId);
   }
 
@@ -580,12 +726,35 @@ async function buildHorariosView(
     return buildEmptyHorariosView(fechaStr, servicio, profesional, 'servicio', excludeReservaId);
   }
 
-  const horariosLibres = await obtenerHorariosLibres(fechaStr, profesional, servicio, excludeReservaId);
+  const todosLibres = await obtenerHorariosLibres(fechaStr, profesional, servicio, excludeReservaId);
+  const horariosLibres = filterHorariosByFranja(todosLibres, franja);
 
-  if (horariosLibres.length === 0) {
+  if (todosLibres.length === 0) {
     const reason =
       fechaStr === getTodayStr() ? 'sin_restantes' : 'ocupado';
     return buildEmptyHorariosView(fechaStr, servicio, profesional, reason, excludeReservaId);
+  }
+
+  if (horariosLibres.length === 0 && franja) {
+    const period = franja === 'manana' ? 'la mañana' : 'la tarde';
+    const keyboard: any[] = [];
+    for (let i = 0; i < todosLibres.length; i += 3) {
+      keyboard.push(
+        todosLibres.slice(i, i + 3).map(h => ({ text: `🕐 ${h}`, callback_data: `hora:${h}` }))
+      );
+    }
+    keyboard.push([
+      { text: '📅 Cambiar fecha', callback_data: 'cambiar_fecha' },
+      BTN.MENU,
+    ]);
+    return {
+      text: withFlowProgress(
+        'hora',
+        `😕 No hay turnos por *${period}* el ${formatDate(fechaStr)}.\n\n` +
+          `Estos son todos los horarios libres:`
+      ),
+      keyboard,
+    };
   }
 
   const keyboard: any[] = [];
@@ -600,16 +769,513 @@ async function buildHorariosView(
   ]);
 
   const duracion = ` · ${serv.duracionMinutos} min`;
+  const franjaHint =
+    franja === 'manana'
+      ? '\n_(Mostrando turnos de la mañana)_'
+      : franja === 'tarde'
+        ? '\n_(Mostrando turnos de la tarde)_'
+        : '';
   return {
     text: withFlowProgress(
       'hora',
       `🗓 *${servicio}*${duracion}\n` +
         `👨‍⚕️ ${profesional}\n` +
-        `📅 ${formatDate(fechaStr)}\n\n` +
+        `📅 ${formatDate(fechaStr)}${franjaHint}\n\n` +
         `⏰ Elegí un horario:`
     ),
     keyboard
   };
+}
+
+/** Nombre del draft/perfil, o undefined si falta / es basura. */
+async function resolvePatientNombre(
+  chatId: number,
+  estado: ConversationState,
+  hint?: string
+): Promise<string | undefined> {
+  return (
+    sanitizePersonName(hint) ||
+    sanitizePersonName(estado.nombre) ||
+    sanitizePersonName((await getUserProfile(chatId, kv))?.nombre)
+  );
+}
+
+/**
+ * Después de elegir hora: pedir nombre si falta; si no, ir a confirmar.
+ * Evita reservar con nombre undefined.
+ */
+async function proceedAfterSlotChosen(
+  chatId: number,
+  estado: ConversationState,
+  hora: string,
+  saveState: (patch: StatePatch) => Promise<void>,
+  sendWithKeyboard: (text: string, keyboard: any) => Promise<void>
+) {
+  const nombre = await resolvePatientNombre(chatId, estado);
+  const base = { ...estado, hora };
+
+  if (!nombre) {
+    await saveState({
+      ...base,
+      paso: 'nombre',
+      clear: ['nombre'],
+    });
+    await sendWithKeyboard(
+      'Dale, ¿a nombre de quién reservo el turno?\n\nEscribí tu nombre (ej: *María López*).',
+      FLOW_CANCEL_KEYBOARD
+    );
+    return;
+  }
+
+  await saveState({ ...base, paso: 'confirmar', nombre });
+  const view = await buildConfirmacionView({ ...base, nombre });
+  await sendWithKeyboard(view.text, view.keyboard);
+}
+
+type AvailabilityToolData = {
+  fechaLabel?: string;
+  feriado?: boolean;
+  count?: number;
+  needServiceChoice?: boolean;
+  recommendation?: { hora: string; profesional: string; servicio: string };
+  window?: { horaPreferida?: string | null };
+  requestedHoraAvailable?: boolean | null;
+};
+
+function buildAvailabilityFallbackMessage(
+  fechaHint: string | null,
+  data: AvailabilityToolData
+): string {
+  if (!fechaHint) {
+    return (
+      'Dale, te ayudo con el turno.\n\n' +
+      '¿Para qué día lo necesitás?\n' +
+      'Podés escribir *mañana*, *el lunes* o tocar un día 👇'
+    );
+  }
+  return buildAvailabilityPatientMessage({
+    fechaLabel: data.fechaLabel || formatDateAR(fechaHint),
+    needServiceChoice: data.needServiceChoice,
+    empty: (data.count ?? 0) === 0,
+    feriado: data.feriado,
+    recommendation: data.recommendation,
+    horaPedida: data.window?.horaPreferida ?? null,
+    requestedHoraAvailable: data.requestedHoraAvailable ?? null,
+  });
+}
+
+async function mergeDraftFromSideEffect(
+  saveState: (patch: StatePatch) => Promise<void>,
+  draft: ConversationState & { clear?: Array<keyof ConversationState> }
+) {
+  const extraClear = draft.clear?.length
+    ? draft.clear
+    : draft.paso === 'hora' || draft.paso === 'fecha'
+      ? (['hora'] as Array<keyof ConversationState>)
+      : [];
+  await saveState({
+    paso: draft.paso,
+    ...(draft.profesional ? { profesional: draft.profesional } : {}),
+    ...(draft.servicio ? { servicio: draft.servicio } : {}),
+    ...(draft.nombre ? { nombre: draft.nombre } : {}),
+    ...(draft.fecha ? { fecha: draft.fecha } : {}),
+    ...(draft.hora ? { hora: draft.hora } : {}),
+    ...(draft.rescheduleId ? { rescheduleId: draft.rescheduleId } : {}),
+    ...(extraClear.length ? { clear: extraClear } : {}),
+  });
+}
+
+/** Misma lógica para texto, fallback y botones (WhatsApp-ready). */
+async function replyWithAvailabilityTool(
+  chatId: number,
+  opts: {
+    fecha?: string;
+    saveState: (patch: StatePatch) => Promise<void>;
+    sendWithKeyboard: (text: string, keyboard?: any) => Promise<void>;
+    handlers?: AssistantToolHandlers;
+  }
+) {
+  const handlers = opts.handlers ?? makeAssistantHandlers(chatId);
+  const tool = await handlers.getAvailability({ fecha: opts.fecha });
+  if (tool.sideEffect?.type === 'set_draft') {
+    await mergeDraftFromSideEffect(opts.saveState, tool.sideEffect.draft);
+  }
+  const data = (tool.data || {}) as AvailabilityToolData;
+  await opts.sendWithKeyboard(
+    buildAvailabilityFallbackMessage(opts.fecha ?? null, data),
+    tool.keyboard && tool.keyboard.length > 0 ? tool.keyboard : ASSIST_KEYBOARD
+  );
+}
+
+/** Aplica side effects del asistente y envía respuesta. true = turno procesado. */
+async function dispatchAssistantTurnResult(
+  chatId: number,
+  result: AssistantTurnResult,
+  ctx: {
+    saveState: (patch: StatePatch) => Promise<void>;
+    sendWithKeyboard: (text: string, keyboard?: any) => Promise<void>;
+    clearState?: () => Promise<void>;
+    draft?: ConversationState;
+  }
+): Promise<boolean> {
+  if (!result.viaLlm) return false;
+
+  const hasPayload =
+    Boolean(result.text?.trim()) ||
+    Boolean(result.keyboard?.length) ||
+    Boolean(result.sideEffect) ||
+    result.usedTools.length > 0;
+  if (!hasPayload) return false;
+
+  if (result.sideEffect?.type === 'start_reschedule') {
+    const reserva = result.sideEffect.reserva;
+    await ctx.saveState({
+      paso: 'fecha',
+      rescheduleId: reserva.id,
+      profesional: reserva.profesional,
+      servicio: reserva.servicio,
+      nombre: reserva.nombre,
+      fecha: reserva.fecha,
+      hora: reserva.hora,
+    });
+    const view = await buildFechasView(reserva.servicio, reserva.profesional, reserva.id);
+    await ctx.sendWithKeyboard(result.text?.trim() || 'Elegí la nueva fecha:', view.keyboard);
+    return true;
+  }
+
+  if (result.sideEffect?.type === 'clear_draft') {
+    if (ctx.clearState) await ctx.clearState();
+    // Preferir prosa de Gemini; replyText solo si el modelo no escribió nada.
+    const replyText =
+      result.text?.trim() ||
+      result.sideEffect.replyText?.trim() ||
+      'Listo.';
+    await ctx.sendWithKeyboard(
+      replyText,
+      result.keyboard && result.keyboard.length > 0 ? result.keyboard : POST_BOOKING_KEYBOARD
+    );
+    return true;
+  }
+
+  if (result.sideEffect?.type === 'confirm_cancel') {
+    const reserva = result.sideEffect.reserva;
+    await ctx.sendWithKeyboard(result.text?.trim() || '¿Confirmás la cancelación?', [
+      [{ text: '✅ Sí, cancelar turno', callback_data: `eliminar:${reserva.id}` }],
+      [{ text: '↩️ Volver', callback_data: 'misreservas' }],
+    ]);
+    return true;
+  }
+
+  if (result.sideEffect?.type === 'set_draft') {
+    const draft = result.sideEffect.draft;
+    await mergeDraftFromSideEffect(ctx.saveState, draft);
+
+    // Gemini escribe el mensaje; el teclado viene de la tool (o vista solo como fallback).
+    if (
+      draft.paso === 'confirmar' &&
+      draft.fecha &&
+      draft.hora &&
+      draft.profesional &&
+      draft.servicio &&
+      draft.nombre
+    ) {
+      const view = await buildConfirmacionView(draft);
+      await ctx.sendWithKeyboard(
+        result.text?.trim() || view.text,
+        result.keyboard && result.keyboard.length > 0 ? result.keyboard : view.keyboard
+      );
+      return true;
+    }
+
+    if (draft.paso === 'nombre' && draft.hora && !draft.nombre) {
+      await ctx.sendWithKeyboard(
+        result.text?.trim() ||
+          'Dale, ¿a nombre de quién reservo el turno?\n\nEscribí tu nombre (ej: *María López*).',
+        result.keyboard && result.keyboard.length > 0 ? result.keyboard : FLOW_CANCEL_KEYBOARD
+      );
+      return true;
+    }
+  }
+
+  const replyText =
+    result.text?.trim() ||
+    (result.keyboard?.length ? 'Perfecto, seguimos:' : '¿En qué más te ayudo?');
+
+  let keyboard =
+    result.keyboard && result.keyboard.length > 0 ? result.keyboard : null;
+  if (!keyboard && ctx.draft?.paso) {
+    keyboard = await getContextualKeyboard(ctx.draft);
+  }
+  await ctx.sendWithKeyboard(replyText, keyboard || ASSIST_KEYBOARD);
+  return true;
+}
+
+function hasHeldBookingSlot(estado: ConversationState | null | undefined): boolean {
+  return Boolean(
+    estado?.hora &&
+      estado?.fecha &&
+      estado?.profesional &&
+      estado?.servicio &&
+      (estado.paso === 'confirmar' || estado.paso === 'nombre')
+  );
+}
+
+async function handleFlowFechaInput(
+  chatId: number,
+  estado: ConversationState,
+  text: string,
+  ctx: {
+    saveState: (patch: StatePatch) => Promise<void>;
+    sendWithKeyboard: (text: string, keyboard?: any) => Promise<void>;
+  }
+): Promise<boolean> {
+  const fechaParseada = parseFecha(text);
+  if (!fechaParseada) return false;
+
+  if (!estado.profesional || !estado.servicio) {
+    await ctx.saveState({
+      ...estado,
+      paso: 'fecha',
+      fecha: fechaParseada,
+      clear: ['hora'],
+    });
+    await replyWithAvailabilityTool(chatId, {
+      fecha: fechaParseada,
+      saveState: ctx.saveState,
+      sendWithKeyboard: ctx.sendWithKeyboard,
+    });
+    return true;
+  }
+
+  const esDiaValido = await esDiaLaborable(fechaParseada, estado.profesional);
+  if (esDiaValido) {
+    await ctx.saveState({
+      paso: 'hora',
+      servicio: estado.servicio,
+      profesional: estado.profesional,
+      nombre: estado.nombre,
+      fecha: fechaParseada,
+      rescheduleId: estado.rescheduleId,
+      clear: ['hora'],
+    });
+    const view = await buildHorariosView(
+      fechaParseada,
+      estado.servicio,
+      estado.profesional,
+      estado.rescheduleId
+    );
+    await ctx.sendWithKeyboard(view.text, view.keyboard);
+  } else {
+    const keyboard = await buildFechasKeyboard(
+      estado.profesional,
+      estado.servicio,
+      estado.rescheduleId
+    );
+    await ctx.sendWithKeyboard('❌ El profesional no atiende ese día. Elegí otro:', keyboard);
+  }
+  return true;
+}
+
+async function handleFlowNombreInput(
+  chatId: number,
+  estado: ConversationState,
+  text: string,
+  ctx: {
+    saveState: (patch: StatePatch) => Promise<void>;
+    sendWithKeyboard: (text: string, keyboard?: any) => Promise<void>;
+  }
+): Promise<boolean> {
+  const extracted = extractPersonName(text);
+  if (!extracted) {
+    await ctx.sendWithKeyboard(
+      withFlowProgress(
+        'nombre',
+        'Necesito tu nombre real para la reserva (sin números ni frases). Por ejemplo: *María López*.'
+      ),
+      FLOW_CANCEL_KEYBOARD
+    );
+    return true;
+  }
+
+  const nombre = capitalizeName(extracted);
+  await saveUserProfile(chatId, nombre, kv);
+
+  if (estado.fecha && estado.hora && estado.profesional && estado.servicio) {
+    await ctx.saveState({ ...estado, paso: 'confirmar', nombre });
+    const view = await buildConfirmacionView({ ...estado, nombre });
+    await ctx.sendWithKeyboard(`Perfecto, *${nombre}* 👋\n\n${view.text}`, view.keyboard);
+  } else {
+    await ctx.saveState({ ...estado, paso: 'fecha', nombre });
+    const view = await buildFechasView(estado.servicio, estado.profesional);
+    await ctx.sendWithKeyboard(`Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
+  }
+  return true;
+}
+
+async function handleFlowHoraInput(
+  chatId: number,
+  estado: ConversationState,
+  text: string,
+  ctx: {
+    saveState: (patch: StatePatch) => Promise<void>;
+    sendWithKeyboard: (text: string, keyboard?: any) => Promise<void>;
+  }
+): Promise<boolean> {
+  if (!estado.fecha || !estado.profesional || !estado.servicio) return false;
+
+  const fechaNueva = parseFecha(text);
+  if (fechaNueva && fechaNueva !== estado.fecha) {
+    const laborable = await esDiaLaborable(fechaNueva, estado.profesional);
+    if (!laborable) {
+      const keyboard = await buildFechasKeyboard(
+        estado.profesional,
+        estado.servicio,
+        estado.rescheduleId
+      );
+      await ctx.sendWithKeyboard(
+        `Ese día (*${formatDateAR(fechaNueva)}*) no hay agenda con *${estado.profesional}*. Elegí otra fecha:`,
+        keyboard
+      );
+      return true;
+    }
+    await ctx.saveState({
+      ...estado,
+      paso: 'hora',
+      fecha: fechaNueva,
+      clear: ['hora'],
+    });
+    const view = await buildHorariosView(
+      fechaNueva,
+      estado.servicio,
+      estado.profesional,
+      estado.rescheduleId
+    );
+    await ctx.sendWithKeyboard(view.text, view.keyboard);
+    return true;
+  }
+
+  const horariosLibres = await obtenerHorariosLibres(
+    estado.fecha,
+    estado.profesional,
+    estado.servicio,
+    estado.rescheduleId
+  );
+
+  const normalizedPeriod = normalizeHumanText(text);
+  const morningPref =
+    /por\s+la\s+manana|a\s+la\s+manana|de\s+manana|x\s+la\s+manana/.test(normalizedPeriod);
+  const afternoonPref =
+    /por\s+la\s+tarde|a\s+la\s+tarde|de\s+tarde|x\s+la\s+tarde/.test(normalizedPeriod);
+  const wantsMorning = morningPref;
+  const wantsAfternoon =
+    afternoonPref ||
+    (/\btarde\b/.test(normalizedPeriod) && !parseFecha(text) && !morningPref);
+  const mentionsConcreteTime = extractHoraCandidates(text).length > 0;
+
+  if ((wantsMorning || wantsAfternoon) && !mentionsConcreteTime) {
+    const filtered = horariosLibres.filter(h => {
+      const hour = parseInt(h.split(':')[0]);
+      return wantsMorning ? hour < 13 : hour >= 13;
+    });
+    if (filtered.length > 0) {
+      const keyboard: any[] = [];
+      for (let i = 0; i < filtered.length; i += 3) {
+        keyboard.push(
+          filtered.slice(i, i + 3).map(h => ({ text: `🕐 ${h}`, callback_data: `hora:${h}` }))
+        );
+      }
+      keyboard.push([
+        { text: '📅 Ver todos', callback_data: 'refresh_horarios' },
+        { text: '🏠 Menú', callback_data: 'menu' },
+      ]);
+      const period = wantsMorning ? 'la mañana (antes de las 13)' : 'la tarde (desde las 13)';
+      await ctx.sendWithKeyboard(
+        withFlowProgress('hora', `⏰ Turnos disponibles por ${period}:`),
+        keyboard
+      );
+    } else {
+      const period = wantsMorning ? 'la mañana' : 'la tarde';
+      const view = await buildHorariosView(
+        estado.fecha,
+        estado.servicio,
+        estado.profesional,
+        estado.rescheduleId
+      );
+      await ctx.sendWithKeyboard(
+        `😕 No hay turnos disponibles por ${period}. Todos los horarios disponibles:`,
+        view.keyboard
+      );
+    }
+    return true;
+  }
+
+  const parsedHora = parseHoraSelection(text, horariosLibres);
+
+  if (parsedHora.status === 'ambiguous') {
+    const keyboard: any[] = [];
+    for (let i = 0; i < parsedHora.candidates.length; i += 3) {
+      keyboard.push(
+        parsedHora.candidates.slice(i, i + 3).map(h => ({
+          text: `🕐 ${h}`,
+          callback_data: `hora:${h}`,
+        }))
+      );
+    }
+    keyboard.push([{ text: '📅 Ver todos', callback_data: 'refresh_horarios' }, BTN.MENU]);
+    await ctx.sendWithKeyboard(
+      withFlowProgress(
+        'hora',
+        `Vi más de un horario (*${parsedHora.candidates.join('*, *')}*). ¿Cuál preferís?`
+      ),
+      keyboard
+    );
+    return true;
+  }
+
+  if (parsedHora.status === 'matched') {
+    const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
+    const disponibilidad = await verificarDisponibilidad(
+      estado.profesional,
+      estado.servicio,
+      estado.fecha,
+      parsedHora.hora,
+      rescheduleOptions
+    );
+
+    if (disponibilidad.disponible) {
+      await proceedAfterSlotChosen(
+        chatId,
+        estado,
+        parsedHora.hora,
+        ctx.saveState,
+        ctx.sendWithKeyboard
+      );
+    } else {
+      const viewActualizada = await buildHorariosView(
+        estado.fecha,
+        estado.servicio,
+        estado.profesional,
+        estado.rescheduleId
+      );
+      await ctx.sendWithKeyboard(
+        `⚠️ ${disponibilidad.mensaje || 'Ese horario no está disponible.'}\n\nElegí otro turno:`,
+        viewActualizada.keyboard
+      );
+    }
+    return true;
+  }
+
+  const view = await buildHorariosView(
+    estado.fecha,
+    estado.servicio,
+    estado.profesional,
+    estado.rescheduleId
+  );
+  await ctx.sendWithKeyboard(
+    'No pude interpretar ese horario. Tocá uno de la lista o escribí por ejemplo *15:30*:',
+    view.keyboard
+  );
+  return true;
 }
 
 // ── Vista de confirmación ────────────────────────────────────────────────────
@@ -660,7 +1326,7 @@ async function verificarDisponibilidad(
 
     const esFeriadoFlag = await isFeriado(fechaStr);
     if (esFeriadoFlag) {
-      return { disponible: false, mensaje: 'Ese día es feriado.' };
+      return { disponible: false, mensaje: buildFeriadoMessage(formatDate(fechaStr)) };
     }
 
     const horarios = await getHorarioProfesional(profesional, dia);
@@ -741,9 +1407,16 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
       return null;
     }
 
+    const nombreOk = sanitizePersonName(datos.nombre);
+    if (!nombreOk) {
+      console.warn(`[RESERVA] nombre inválido o vacío: ${datos.nombre}`);
+      return null;
+    }
+
     const id = generateId();
     const reserva: Reservation = {
       ...datos,
+      nombre: nombreOk,
       id,
       reminder24hSent: false,
       reminder1hSent: false,
@@ -783,7 +1456,16 @@ async function guardarReserva(chatId: number, datos: Omit<Reservation, 'id'>): P
       await kv.set(userKey, JSON.stringify(reservasArray));
     }
 
-    await saveUserProfile(chatId, datos.nombre, kv);
+    await saveUserProfile(
+      chatId,
+      {
+        nombre: datos.nombre,
+        lastProfesional: datos.profesional,
+        lastServicio: datos.servicio,
+      },
+      kv
+    );
+    await notifyStaff('created', reserva);
     return reserva;
   } catch (error) {
     console.error('Error al guardar reserva:', error);
@@ -815,6 +1497,8 @@ async function reprogramarReserva(
     if (!disponibilidad.disponible) {
       return null;
     }
+
+    const previous = { fecha: reserva.fecha, hora: reserva.hora };
 
     if (kv) {
       await kv.del(reservaKey(reserva.profesional, reserva.fecha, reserva.hora));
@@ -867,6 +1551,18 @@ async function reprogramarReserva(
     // El día anterior quedó con un hueco → avisar lista de espera
     await pingWaitlist(reserva.profesional, reserva.fecha);
 
+    await saveUserProfile(
+      chatId,
+      {
+        nombre: updatedReservation.nombre,
+        lastProfesional: updatedReservation.profesional,
+        lastServicio: updatedReservation.servicio,
+      },
+      kv
+    );
+
+    await notifyStaff('rescheduled', updatedReservation, previous);
+
     return updatedReservation;
   } catch (error) {
     console.error('Error al reprogramar reserva:', error);
@@ -913,6 +1609,10 @@ async function eliminarReserva(chatId: number, reservaId: string): Promise<Reser
       }
     }
 
+    if (reservaEliminada) {
+      await notifyStaff('cancelled', reservaEliminada);
+    }
+
     return reservaEliminada || false;
   } catch (error) {
     console.error('Error al eliminar reserva:', error);
@@ -952,7 +1652,7 @@ async function checkReservationLimit(chatId: number): Promise<boolean> {
 // Groq Integration
 const WELCOME_MESSAGE =
   '¡Hola! 👋 Soy el asistente de la clínica.\n\n' +
-  '¿En qué puedo ayudarte hoy?\n' +
+  '¿En qué te ayudo?\n' +
   '*(Atención particular, sin obra social)*';
 
 const MAIN_MENU_KEYBOARD = [
@@ -1066,17 +1766,69 @@ async function continueAfterProfessional(
   const servicio = estado.servicio;
 
   if (servicio) {
+    // Chatbot: si ya hay fecha, mostrar cupos (no reiniciar eligiendo día)
+    if (estado.fecha) {
+      const nombre = await resolvePatientNombre(chatId, {
+        ...estado,
+        profesional: profSeleccionado,
+        servicio,
+      });
+      if (!nombre && !estado.rescheduleId) {
+        const step = await buildNombreStep(
+          { ...estado, profesional: profSeleccionado, servicio, fecha: estado.fecha },
+          chatId,
+          intro
+        );
+        await saveState(step.estado);
+        await sendWithKeyboard(step.text, step.keyboard);
+        return;
+      }
+      await saveState({
+        ...estado,
+        paso: 'hora',
+        profesional: profSeleccionado,
+        servicio,
+        fecha: estado.fecha,
+        ...(nombre ? { nombre } : {}),
+        clear: ['hora'],
+      });
+      const view = await buildHorariosView(
+        estado.fecha,
+        servicio,
+        profSeleccionado,
+        estado.rescheduleId
+      );
+      await sendWithKeyboard(
+        `${intro}${nombre ? `Hola *${nombre}* 👋\n\n` : ''}${view.text}`,
+        view.keyboard
+      );
+      return;
+    }
+
     if (estado.nombre || estado.rescheduleId) {
-      const nombre = estado.nombre!;
+      const nombre = sanitizePersonName(estado.nombre);
+      if (!nombre && !estado.rescheduleId) {
+        const step = await buildNombreStep(
+          { ...estado, profesional: profSeleccionado, servicio },
+          chatId,
+          intro
+        );
+        await saveState(step.estado);
+        await sendWithKeyboard(step.text, step.keyboard);
+        return;
+      }
       await saveState({
         ...estado,
         paso: 'fecha',
         profesional: profSeleccionado,
         servicio,
-        nombre,
+        ...(nombre ? { nombre } : {}),
       });
       const view = await buildFechasView(servicio, profSeleccionado);
-      await sendWithKeyboard(`${intro}Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
+      await sendWithKeyboard(
+        `${intro}${nombre ? `Hola *${nombre}* 👋\n\n` : ''}${view.text}`,
+        view.keyboard
+      );
     } else {
       const step = await buildNombreStep(
         { ...estado, profesional: profSeleccionado, servicio },
@@ -1097,12 +1849,159 @@ async function continueAfterProfessional(
   );
 }
 
+/** Elegir servicio (botón o texto). Respeta fecha ya pedida en el chatbot. */
+async function applyServicioSelection(
+  chatId: number,
+  estado: ConversationState,
+  servicioSeleccionado: string,
+  saveState: (s: StatePatch) => Promise<void>,
+  sendWithKeyboard: (t: string, k?: any) => Promise<void>
+) {
+  if (!estado.profesional) {
+    const limitReached = await checkReservationLimit(chatId);
+    if (limitReached && !estado.paso) {
+      await sendWithKeyboard(buildLimitReachedMessage(MAX_RESERVACIONES_POR_USUARIO), [
+        [BTN.MIS_RESERVAS],
+        [BTN.MENU],
+      ]);
+      return;
+    }
+    if (estado.fecha) {
+      const profs = await getProfesionales();
+      const conCupo: string[] = [];
+      for (const p of profs) {
+        const libres = await obtenerHorariosLibres(
+          estado.fecha,
+          p,
+          servicioSeleccionado,
+          estado.rescheduleId
+        );
+        if (libres.length > 0) conCupo.push(p);
+      }
+      if (conCupo.length === 1) {
+        await continueAfterProfessional(
+          chatId,
+          { ...estado, servicio: servicioSeleccionado, fecha: estado.fecha },
+          conCupo[0],
+          saveState,
+          sendWithKeyboard,
+          `*${servicioSeleccionado}* ✔️\n\n`
+        );
+        return;
+      }
+      await saveState({
+        paso: 'profesional',
+        servicio: servicioSeleccionado,
+        fecha: estado.fecha,
+        ...(estado.nombre ? { nombre: estado.nombre } : {}),
+        ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+        clear: ['profesional', 'hora'],
+      });
+      await sendWithKeyboard(
+        `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+        await buildProfesionalesKeyboard(servicioSeleccionado)
+      );
+      return;
+    }
+    await saveState({
+      paso: 'profesional',
+      servicio: servicioSeleccionado,
+      clear: ['profesional', 'fecha', 'hora'],
+    });
+    await sendWithKeyboard(
+      `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`,
+      await buildProfesionalesKeyboard(servicioSeleccionado)
+    );
+    return;
+  }
+
+  if ((estado.nombre || estado.rescheduleId) && estado.fecha) {
+    await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado });
+    const view = await buildHorariosView(
+      estado.fecha,
+      servicioSeleccionado,
+      estado.profesional,
+      estado.rescheduleId
+    );
+    await sendWithKeyboard(view.text, view.keyboard);
+    return;
+  }
+
+  if (estado.fecha) {
+    // Hay fecha + profesional, falta nombre
+    const nombre = await resolvePatientNombre(chatId, {
+      ...estado,
+      servicio: servicioSeleccionado,
+    });
+    if (nombre) {
+      await saveState({
+        ...estado,
+        paso: 'hora',
+        servicio: servicioSeleccionado,
+        nombre,
+        clear: ['hora'],
+      });
+      const view = await buildHorariosView(
+        estado.fecha,
+        servicioSeleccionado,
+        estado.profesional!,
+        estado.rescheduleId
+      );
+      await sendWithKeyboard(`Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
+    } else {
+      const step = await buildNombreStep(
+        { ...estado, servicio: servicioSeleccionado },
+        chatId,
+        `*${servicioSeleccionado}* ✔️\n\n`
+      );
+      await saveState(step.estado);
+      await sendWithKeyboard(step.text, step.keyboard);
+    }
+    return;
+  }
+
+  if (estado.nombre || estado.rescheduleId) {
+    const nombre = sanitizePersonName(estado.nombre);
+    await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado });
+    const view = await buildFechasView(servicioSeleccionado, estado.profesional);
+    await sendWithKeyboard(
+      `${nombre ? `Hola *${nombre}* 👋\n\n` : ''}${view.text}`,
+      view.keyboard
+    );
+    return;
+  }
+
+  const step = await buildNombreStep(
+    { ...estado, servicio: servicioSeleccionado },
+    chatId,
+    `*${servicioSeleccionado}* ✔️\n\n`
+  );
+  await saveState(step.estado);
+  await sendWithKeyboard(step.text, step.keyboard);
+}
+
+function matchServicioFromText(
+  text: string,
+  servicios: Array<{ nombre: string }>
+): string | null {
+  const normalized = normalizeHumanText(text);
+  if (['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w => normalized.includes(w))) {
+    return servicios[Math.floor(Math.random() * servicios.length)]?.nombre || null;
+  }
+  const num = parseInt(text, 10);
+  if (!isNaN(num) && num >= 1 && num <= servicios.length) {
+    return servicios[num - 1].nombre;
+  }
+  return servicios.find(s => matchesLoosely(s.nombre, text))?.nombre || null;
+}
+
 /** Flujo canónico: profesional → servicio → nombre → fecha → hora. */
 async function startBookingWithProfessional(
   saveState: (s: StatePatch) => Promise<void>,
   sendWithKeyboard: (t: string, k?: any) => Promise<void>,
   intro = '¿Con qué profesional te querés atender?',
-  keep?: Pick<ConversationState, 'fecha' | 'nombre'>
+  keep?: Pick<ConversationState, 'fecha' | 'nombre'>,
+  chatId?: number
 ) {
   await saveState({
     paso: 'profesional',
@@ -1112,9 +2011,18 @@ async function startBookingWithProfessional(
       ['profesional', 'servicio', 'nombre', 'fecha', 'hora', 'rescheduleId'] as const
     ).filter(k => !(keep && k in keep && (keep as any)[k] !== undefined)),
   });
+
+  const keyboard = await buildProfesionalesKeyboard();
+  if (chatId) {
+    const profile = await getUserProfile(chatId, kv);
+    if (profile?.lastProfesional && profile?.lastServicio) {
+      keyboard.unshift([buildRebookButton(profile.lastProfesional, profile.lastServicio)]);
+    }
+  }
+
   await sendWithKeyboard(
     withFlowProgress('profesional', intro),
-    await buildProfesionalesKeyboard()
+    keyboard
   );
 }
 
@@ -1167,7 +2075,7 @@ async function getContextualKeyboard(estado: ConversationState, _chatId?: number
     case 'nombre':
       return FLOW_CANCEL_KEYBOARD;
     case 'fecha':
-      return await buildFechasKeyboard(estado.profesional);
+      return await buildFechasKeyboard(estado.profesional, estado.servicio, estado.rescheduleId);
     case 'hora': {
       if (estado.fecha && estado.servicio && estado.profesional) {
         const view = await buildHorariosView(estado.fecha, estado.servicio, estado.profesional, estado.rescheduleId);
@@ -1187,7 +2095,8 @@ async function getContextualKeyboard(estado: ConversationState, _chatId?: number
 /** Pide nombre o confirma el del perfil (precisión / wow). */
 async function buildNombreStep(estado: ConversationState, chatId: number, prefix = '') {
   const profile = await getUserProfile(chatId, kv);
-  const known = estado.nombre || profile?.nombre;
+  const known =
+    sanitizePersonName(estado.nombre) || sanitizePersonName(profile?.nombre);
 
   if (known) {
     return {
@@ -1216,24 +2125,48 @@ const POST_BOOKING_KEYBOARD = [[BTN.MIS_RESERVAS], [BTN.MENU]];
 
 const DAY_NAMES = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
 
+function formatScheduleDayRanges(
+  schedule: Record<number, Array<{ inicio: string; fin: string }>>
+): string[] {
+  const days = Object.keys(schedule)
+    .map(Number)
+    .sort((a, b) => a - b);
+  const lines: string[] = [];
+  let i = 0;
+  while (i < days.length) {
+    const start = days[i];
+    const slotText = (schedule[start] || [])
+      .map(slot => `${slot.inicio}–${slot.fin}`)
+      .join(' y ');
+    let end = start;
+    while (
+      i + 1 < days.length &&
+      days[i + 1] === end + 1 &&
+      (schedule[days[i + 1]] || []).map(s => `${s.inicio}–${s.fin}`).join(' y ') === slotText
+    ) {
+      i += 1;
+      end = days[i];
+    }
+    const label =
+      start === end
+        ? DAY_NAMES[start]
+        : `${DAY_NAMES[start].slice(0, 3)}–${DAY_NAMES[end].slice(0, 3)}`;
+    lines.push(`• *${label}:* ${slotText}`);
+    i += 1;
+  }
+  return lines;
+}
+
 async function buildHorariosInfoMessage(): Promise<string> {
   const config = await getConfig();
   let message = '⏰ *Horarios de atención*\n\n*(Atención particular, sin obra social)*\n\n';
 
   for (const [profesional, schedule] of Object.entries(config.profesionales)) {
     message += `👨‍⚕️ *${profesional}*\n`;
-    const days = Object.keys(schedule).map(Number).sort((a, b) => a - b);
-
-    for (const day of days) {
-      const slots = schedule[day];
-      const slotText = slots.map(slot => `${slot.inicio} a ${slot.fin}`).join(' y ');
-      message += `• ${DAY_NAMES[day]}: ${slotText}\n`;
-    }
-
-    message += '\n';
+    message += `${formatScheduleDayRanges(schedule).join('\n')}\n\n`;
   }
 
-  message += 'Si querés, puedo ayudarte a reservar un turno disponible.';
+  message += 'Si querés, te ayudo a reservar un turno 👇';
   return message;
 }
 
@@ -1258,7 +2191,8 @@ async function buildClinicContextForAI(): Promise<string> {
     context += `- ${servicio.nombre}: $${servicio.precio.toLocaleString('es-AR')} (${servicio.duracionMinutos} min)\n`;
   }
 
-  context += '\nProfesionales y horarios:\n';
+  context +=
+    '\nAgenda semanal ORIENTATIVA (NO son turnos libres; para cupos usá siempre get_availability):\n';
   for (const [profesional, schedule] of Object.entries(config.profesionales)) {
     context += `${profesional}:\n`;
     const days = Object.keys(schedule).map(Number).sort((a, b) => a - b);
@@ -1270,6 +2204,9 @@ async function buildClinicContextForAI(): Promise<string> {
   }
 
   context += '\nAtención particular. NO se recibe obra social.\n';
+  context += 'Formas de pago: efectivo, transferencia y Mercado Pago (en el consultorio).\n';
+  context += 'Cancelaciones: el paciente puede cancelar o reprogramar desde Mis reservas en el bot; pedir anticipación cuando sea posible.\n';
+  context += 'Qué traer: ropa cómoda; llegar unos minutos antes.\n';
   context += `Dirección: ${getClinicAddress()}\n`;
   context += `Mapa: ${getClinicMapsUrl()}\n`;
   return context;
@@ -1323,7 +2260,7 @@ REGLAS DE CLASIFICACIÓN:
 - Usuario pide ver servicios, precios, sesiones o "mostrame los servicios" → action: "servicios" (NUNCA "consulta")
 - Usuario solo pregunta algo sin intención de reservar ni ver catálogo → action: "consulta"
 - Usuario saluda o pide menú → action: "menu"
-- Usuario menciona "mis reservas" → action: "misreservas"
+- Usuario pregunta por su turno / mis reservas / a qué hora es / ya reservé → action: "misreservas"
 
 EXTRACCIÓN DE PARÁMETROS (siempre intentá extraer):
 - profesional: si mencionó un profesional de la lista
@@ -1409,10 +2346,19 @@ async function resolveTextIntent(
     aiResult.shouldContinueWithFlow = false;
   }
 
-  // La UX de navegación la manda el intent local: la IA puede equivocarse en el action
-  // y dejar botones genéricos cuando el usuario pidió servicios / reservar.
+  // Sin flujo: la UX de navegación la manda el intent local.
+  // Con flujo activo: NO pisar con reservar/servicios (eso reiniciaba y "saltaba").
   const navActions = new Set(['servicios', 'reservar', 'misreservas', 'profesionales', 'menu']);
   if (localIntent && navActions.has(localIntent.action)) {
+    if (hasActiveFlow && localIntent.action !== 'menu') {
+      // Seguir en el paso; el webhook avanza o re-pregunta
+      return {
+        responseText: aiResult.responseText || '',
+        intent: { action: 'reservar', parameters: aiResult.intent?.parameters },
+        shouldContinueWithFlow: true,
+      };
+    }
+
     const aiAction = aiResult.intent?.action || 'unknown';
     const shouldOverride =
       aiAction === 'unknown' ||
@@ -1433,10 +2379,7 @@ async function resolveTextIntent(
             ...aiResult.intent?.parameters,
           },
         },
-        // Solo continuar flujo si hay paso activo de verdad
-        shouldContinueWithFlow: Boolean(
-          hasActiveFlow && aiResult.shouldContinueWithFlow && localIntent.action === 'reservar'
-        ),
+        shouldContinueWithFlow: false,
       };
     }
   }
@@ -1455,14 +2398,47 @@ async function resolveTextIntent(
   return aiResult;
 }
 
+async function loadUserReservations(chatId: number): Promise<Reservation[]> {
+  if (kv) {
+    const userReservasKey = `user:${chatId}:reservas`;
+    const userReservas = (await kv.get(userReservasKey)) || [];
+    const rawArray = Array.isArray(userReservas)
+      ? userReservas
+      : JSON.parse(userReservas as string);
+
+    const validReservations: Reservation[] = [];
+    let changed = false;
+    for (const r of rawArray) {
+      const exists = await kv.get(`reserva:id:${r.id}`);
+      if (exists) {
+        validReservations.push(r);
+      } else {
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await kv.set(userReservasKey, JSON.stringify(validReservations));
+    }
+    return validReservations;
+  }
+
+  return getLocalReservations().filter(r => r.chatId === chatId);
+}
+
+function filterUpcomingReservations(reservasArray: Reservation[], nowMs = Date.now()): Reservation[] {
+  return reservasArray
+    .filter(r => {
+      // Interpretar fecha/hora en ART (UTC-3), no en TZ del server
+      const at = Date.parse(`${r.fecha}T${r.hora}:00-03:00`);
+      return !Number.isNaN(at) && at >= nowMs - 60 * 60 * 1000;
+    })
+    .sort((a, b) => `${a.fecha}T${a.hora}`.localeCompare(`${b.fecha}T${b.hora}`));
+}
+
 async function buildMisReservasKeyboard(reservasArray: Reservation[]) {
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
-  const now = Date.now();
-
-  const futuras = reservasArray.filter(r => {
-    const at = new Date(`${r.fecha}T${r.hora}:00`).getTime();
-    return at >= now - 60 * 60 * 1000; // incluir hasta 1h después por tolerancia
-  });
+  const futuras = filterUpcomingReservations(reservasArray);
 
   for (const reservation of futuras) {
     const shortName = reservation.profesional.split(' ')[0];
@@ -1478,6 +2454,932 @@ async function buildMisReservasKeyboard(reservasArray: Reservation[]) {
 
   keyboard.push([BTN.MENU]);
   return { keyboard, futuras, pastCount: reservasArray.length - futuras.length };
+}
+
+async function startRescheduleForReserva(
+  reserva: Reservation,
+  saveState: (patch: StatePatch) => Promise<void>,
+  sendWithKeyboard: (text: string, keyboard: any) => Promise<void>
+) {
+  await saveState({
+    paso: 'fecha',
+    rescheduleId: reserva.id,
+    profesional: reserva.profesional,
+    servicio: reserva.servicio,
+    nombre: reserva.nombre,
+    fecha: reserva.fecha,
+    hora: reserva.hora,
+  });
+  const view = await buildFechasView(reserva.servicio, reserva.profesional, reserva.id);
+  const shortName = reserva.profesional.split(' ')[0];
+  await sendWithKeyboard(
+    `🔄 *Cambiar turno*\n\n` +
+      `Ahora tenés *${formatDateShortSafe(reserva.fecha)}* a las *${reserva.hora}* ` +
+      `(*${reserva.servicio}* con *${shortName}*).\n\n` +
+      `Elegí la nueva fecha:`,
+    view.keyboard
+  );
+}
+
+async function showCancelConfirm(
+  reserva: Reservation,
+  sendWithKeyboard: (text: string, keyboard: any) => Promise<void>
+) {
+  await sendWithKeyboard(
+    `⚠️ *¿Cancelar este turno?*\n\n` +
+      `👨‍⚕️ ${reserva.profesional}\n` +
+      `🩺 ${reserva.servicio}\n` +
+      `📅 ${formatDateAR(reserva.fecha)} · ${reserva.hora}\n\n` +
+      `Esta acción no se puede deshacer.`,
+    [
+      [{ text: '✅ Sí, cancelar turno', callback_data: `eliminar:${reserva.id}` }],
+      [{ text: '↩️ Volver', callback_data: 'misreservas' }],
+    ]
+  );
+}
+
+function buildAgentConfirmKeyboard(isReschedule = false): Array<
+  Array<{ text: string; callback_data: string }>
+> {
+  return [
+    [
+      {
+        text: '✅ Confirmar',
+        callback_data: isReschedule ? 'confirmar_reprogramar' : 'confirmar_reserva',
+      },
+    ],
+    [
+      { text: '🕐 Otra hora', callback_data: 'refresh_horarios' },
+      { text: '📅 Otra fecha', callback_data: 'cambiar_fecha' },
+    ],
+    [BTN.MENU],
+  ];
+}
+
+function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
+  const holdSlot: AssistantToolHandlers['holdSlot'] = async args => {
+    const profesionales = await getProfesionales();
+    const serviciosList = await getServiciosList();
+    const profesional = profesionales.find(p => matchesLoosely(p, args.profesional));
+    const servicio = serviciosList.find(s => matchesLoosely(s.nombre, args.servicio))?.nombre;
+    const fecha =
+      args.fecha && /^\d{4}-\d{2}-\d{2}$/.test(args.fecha)
+        ? args.fecha
+        : parseFecha(args.fecha);
+
+    let hora = args.hora.trim();
+    if (/^\d{1,2}$/.test(hora)) hora = `${hora.padStart(2, '0')}:00`;
+    else if (/^\d{1,2}:\d{2}$/.test(hora)) {
+      const [h, m] = hora.split(':').map(Number);
+      hora = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    }
+
+    if (!profesional || !servicio || !fecha) {
+      return {
+        data: {
+          held: false,
+          need: {
+            profesional: !profesional,
+            servicio: !servicio,
+            fecha: !fecha,
+          },
+          note: 'Faltan datos para trabar el turno. Pedí lo que falte o llamá get_availability.',
+        },
+      };
+    }
+
+    const estado = await loadConversationState(chatId);
+    const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
+    const disponibilidad = await verificarDisponibilidad(
+      profesional,
+      servicio,
+      fecha,
+      hora,
+      rescheduleOptions
+    );
+
+    if (!disponibilidad.disponible) {
+      const slots = await obtenerHorariosLibres(fecha, profesional, servicio);
+      const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+      for (let i = 0; i < Math.min(slots.length, 9); i += 3) {
+        keyboard.push(
+          slots.slice(i, i + 3).map(h => ({
+            text: `🕐 ${h}`,
+            callback_data: `hora:${h}`,
+          }))
+        );
+      }
+      keyboard.push([BTN.MENU]);
+      return {
+        data: {
+          held: false,
+          available: false,
+          reason: disponibilidad.mensaje || 'Horario no disponible',
+          fecha,
+          fechaLabel: formatDateAR(fecha),
+          profesional,
+          servicio,
+          requestedHora: hora,
+          slots,
+        },
+        keyboard,
+        sideEffect: {
+          type: 'set_draft',
+          draft: {
+            paso: 'hora',
+            profesional,
+            servicio,
+            fecha,
+            ...(estado.nombre ? { nombre: estado.nombre } : {}),
+            ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+          },
+        },
+      };
+    }
+
+    const nombre = await resolvePatientNombre(chatId, estado, args.nombre);
+    const isReschedule = Boolean(estado.rescheduleId);
+
+    if (!nombre) {
+      return {
+        data: {
+          held: true,
+          needNombre: true,
+          fecha,
+          fechaLabel: formatDateAR(fecha),
+          weekday: DAY_NAMES[dayOfWeekFromFechaStr(fecha)],
+          profesional,
+          servicio,
+          hora,
+          note:
+            'Turno trabado. Pedí el nombre del paciente. En el próximo mensaje llamá set_patient_name. No digas "undefined".',
+        },
+        keyboard: [[BTN.CANCEL_FLOW], [BTN.MENU]],
+        sideEffect: {
+          type: 'set_draft',
+          draft: {
+            paso: 'nombre',
+            profesional,
+            servicio,
+            fecha,
+            hora,
+            clear: ['nombre'],
+            ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+          },
+        },
+      };
+    }
+
+    return {
+      data: {
+        held: true,
+        needNombre: false,
+        readyToConfirm: true,
+        fecha,
+        fechaLabel: formatDateAR(fecha),
+        weekday: DAY_NAMES[dayOfWeekFromFechaStr(fecha)],
+        profesional,
+        servicio,
+        hora,
+        nombre,
+        isReschedule,
+        note: 'Turno listo para confirmar. Escribí vos el resumen; el teclado tiene Confirmar.',
+      },
+      keyboard: buildAgentConfirmKeyboard(isReschedule),
+      sideEffect: {
+        type: 'set_draft',
+        draft: {
+          paso: 'confirmar',
+          profesional,
+          servicio,
+          fecha,
+          hora,
+          nombre,
+          ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+        },
+      },
+    };
+  };
+
+  const setPatientName: AssistantToolHandlers['setPatientName'] = async args => {
+    const estado = await loadConversationState(chatId);
+    const extracted = extractPersonName(args.nombre);
+    if (!extracted) {
+      return {
+        data: {
+          accepted: false,
+          needNombre: true,
+          error: 'nombre_invalido',
+          note:
+            'Ese texto no sirve como nombre. Pedí el nombre real (ej. María López), sin números ni frases largas.',
+        },
+        keyboard: [[BTN.CANCEL_FLOW], [BTN.MENU]],
+        sideEffect: {
+          type: 'set_draft',
+          draft: {
+            paso: 'nombre',
+            ...(estado.profesional ? { profesional: estado.profesional } : {}),
+            ...(estado.servicio ? { servicio: estado.servicio } : {}),
+            ...(estado.fecha ? { fecha: estado.fecha } : {}),
+            ...(estado.hora ? { hora: estado.hora } : {}),
+            ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+          },
+        },
+      };
+    }
+
+    const nombre = capitalizeName(extracted);
+    await saveUserProfile(chatId, nombre, kv);
+    const isReschedule = Boolean(estado.rescheduleId);
+
+    if (estado.fecha && estado.hora && estado.profesional && estado.servicio) {
+      return {
+        data: {
+          accepted: true,
+          readyToConfirm: true,
+          needNombre: false,
+          nombre,
+          profesional: estado.profesional,
+          servicio: estado.servicio,
+          fecha: estado.fecha,
+          fechaLabel: formatDateAR(estado.fecha),
+          hora: estado.hora,
+          isReschedule,
+          note: 'Nombre guardado. Escribí vos el resumen y pedí confirmación; el teclado tiene Confirmar.',
+        },
+        keyboard: buildAgentConfirmKeyboard(isReschedule),
+        sideEffect: {
+          type: 'set_draft',
+          draft: {
+            paso: 'confirmar',
+            profesional: estado.profesional,
+            servicio: estado.servicio,
+            fecha: estado.fecha,
+            hora: estado.hora,
+            nombre,
+            ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+          },
+        },
+      };
+    }
+
+    const keyboard =
+      estado.servicio || estado.profesional
+        ? (await buildFechasView(estado.servicio, estado.profesional, estado.rescheduleId)).keyboard
+        : FLOW_CANCEL_KEYBOARD;
+
+    return {
+      data: {
+        accepted: true,
+        readyToConfirm: false,
+        needNombre: false,
+        needFecha: true,
+        nombre,
+        profesional: estado.profesional || null,
+        servicio: estado.servicio || null,
+        note: 'Nombre guardado. Seguí pidiendo fecha/hora según lo que falte; no reinicies el flujo.',
+      },
+      keyboard,
+      sideEffect: {
+        type: 'set_draft',
+        draft: {
+          paso: 'fecha',
+          nombre,
+          ...(estado.profesional ? { profesional: estado.profesional } : {}),
+          ...(estado.servicio ? { servicio: estado.servicio } : {}),
+          ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+        },
+      },
+    };
+  };
+
+
+  const confirmBooking: AssistantToolHandlers['confirmBooking'] = async args => {
+    const estado = await loadConversationState(chatId);
+    if (!args.confirm) {
+      return {
+        data: { booked: false, cancelled: true, note: 'Armado cancelado. Avisá al paciente en prosa.' },
+        keyboard: ASSIST_KEYBOARD,
+        sideEffect: { type: 'clear_draft' },
+      };
+    }
+
+    if (!estado.fecha || !estado.hora || !estado.profesional || !estado.servicio) {
+      return {
+        data: {
+          booked: false,
+          error: 'draft_incompleto',
+          note: 'Falta hold_slot / datos antes de confirmar.',
+        },
+        keyboard: ASSIST_KEYBOARD,
+      };
+    }
+
+    const nombreOk = await resolvePatientNombre(chatId, estado);
+    if (!nombreOk) {
+      return {
+        data: { booked: false, needNombre: true, note: 'Falta nombre → set_patient_name.' },
+        keyboard: [[BTN.CANCEL_FLOW], [BTN.MENU]],
+        sideEffect: {
+          type: 'set_draft',
+          draft: {
+            paso: 'nombre',
+            profesional: estado.profesional,
+            servicio: estado.servicio,
+            fecha: estado.fecha,
+            hora: estado.hora,
+            ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+          },
+        },
+      };
+    }
+
+    const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
+    const disponibilidad = await verificarDisponibilidad(
+      estado.profesional,
+      estado.servicio,
+      estado.fecha,
+      estado.hora,
+      rescheduleOptions
+    );
+
+    if (!disponibilidad.disponible) {
+      const view = await buildHorariosView(
+        estado.fecha,
+        estado.servicio,
+        estado.profesional,
+        estado.rescheduleId
+      );
+      return {
+        data: {
+          booked: false,
+          available: false,
+          reason: disponibilidad.mensaje || 'Horario no disponible',
+        },
+        keyboard: view.keyboard,
+        sideEffect: {
+          type: 'set_draft',
+          draft: {
+            paso: 'hora',
+            profesional: estado.profesional,
+            servicio: estado.servicio,
+            fecha: estado.fecha,
+            nombre: nombreOk,
+            ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+          },
+        },
+      };
+    }
+
+    if (estado.rescheduleId) {
+      const reserva = await reprogramarReserva(
+        chatId,
+        estado.rescheduleId,
+        estado.fecha,
+        estado.hora
+      );
+      if (!reserva) {
+        return { data: { booked: false, error: 'reprogramar_fallo' }, keyboard: ASSIST_KEYBOARD };
+      }
+      return {
+        data: {
+          booked: true,
+          isReschedule: true,
+          reserva: {
+            id: reserva.id,
+            fecha: reserva.fecha,
+            hora: reserva.hora,
+            profesional: reserva.profesional,
+            servicio: reserva.servicio,
+            nombre: reserva.nombre,
+          },
+          note: 'Reprogramación OK. Confirmá al paciente en prosa con los datos de reserva.',
+        },
+        keyboard: POST_BOOKING_KEYBOARD,
+        sideEffect: { type: 'clear_draft' },
+      };
+    }
+
+    const reserva = await guardarReserva(chatId, {
+      profesional: estado.profesional,
+      servicio: estado.servicio,
+      nombre: nombreOk,
+      fecha: estado.fecha,
+      hora: estado.hora,
+      chatId,
+    });
+
+    if (!reserva) {
+      const view = await buildHorariosView(estado.fecha, estado.servicio, estado.profesional);
+      return {
+        data: { booked: false, reason: 'race_taken' },
+        keyboard: view.keyboard,
+      };
+    }
+
+    return {
+      data: {
+        booked: true,
+        isReschedule: false,
+        reserva: {
+          id: reserva.id,
+          fecha: reserva.fecha,
+          hora: reserva.hora,
+          profesional: reserva.profesional,
+          servicio: reserva.servicio,
+          nombre: reserva.nombre,
+        },
+        note: 'Reserva OK. Confirmá al paciente en prosa con los datos de reserva.',
+      },
+      keyboard: POST_BOOKING_KEYBOARD,
+      sideEffect: { type: 'clear_draft' },
+    };
+  };
+
+
+  return {
+    holdSlot,
+    setPatientName,
+    confirmBooking,
+
+    async getClinicInfo(topic: ClinicInfoTopic) {
+      // Solo HECHOS: Gemini escribe el mensaje. No devolver copy listo para el paciente.
+      const config = await getConfig();
+      const servicios = await getServiciosList();
+      let keyboard: typeof ASSIST_KEYBOARD | Awaited<ReturnType<typeof buildServiciosKeyboard>> =
+        ASSIST_KEYBOARD;
+      let facts: Record<string, unknown> = { topic };
+
+      switch (topic) {
+        case 'horarios': {
+          const porProfesional: Record<string, string[]> = {};
+          for (const [profesional, schedule] of Object.entries(config.profesionales)) {
+            porProfesional[profesional] = Object.keys(schedule)
+              .map(Number)
+              .sort((a, b) => a - b)
+              .map(day => {
+                const slots = schedule[day];
+                const slotText = slots.map(s => `${s.inicio}-${s.fin}`).join(', ');
+                return `${DAY_NAMES[day]}: ${slotText}`;
+              });
+          }
+          facts = { topic, porProfesional, atencion: 'particular' };
+          break;
+        }
+        case 'precios':
+          facts = {
+            topic,
+            servicios: servicios.map(s => ({
+              nombre: s.nombre,
+              precio: s.precio,
+              duracionMinutos: s.duracionMinutos,
+            })),
+          };
+          keyboard = await buildServiciosKeyboard(false);
+          break;
+        case 'ubicacion':
+          facts = {
+            topic,
+            direccion: getClinicAddress(),
+            mapsUrl: getClinicMapsUrl(),
+          };
+          break;
+        case 'pago':
+          facts = {
+            topic,
+            medios: ['efectivo', 'transferencia', 'Mercado Pago'],
+            donde: 'en el consultorio',
+            obraSocial: false,
+          };
+          break;
+        case 'obra_social':
+          facts = { topic, aceptaObraSocial: false, atencion: 'particular' };
+          break;
+        case 'que_traer':
+          facts = {
+            topic,
+            items: ['ropa cómoda', 'llegar unos minutos antes'],
+            ordenMedica: false,
+          };
+          break;
+        case 'estacionamiento':
+          facts = {
+            topic,
+            direccion: getClinicAddress(),
+            nota: 'estacionamiento en la zona / cuadra',
+          };
+          break;
+        case 'duracion':
+          facts = {
+            topic,
+            servicios: servicios.map(s => ({
+              nombre: s.nombre,
+              duracionMinutos: s.duracionMinutos,
+            })),
+          };
+          break;
+        case 'cancelacion':
+          facts = {
+            topic,
+            puedeCancelarPorBot: true,
+            recordatorios: ['24h', '1h'],
+            pedirAnticipacion: true,
+          };
+          break;
+        default:
+          facts = { topic, resumen: await buildClinicContextForAI() };
+          break;
+      }
+
+      return { data: { topic, facts }, keyboard };
+    },
+
+    async getMyAppointments(action: AppointmentsAction) {
+      const all = await loadUserReservations(chatId);
+      const futuras = filterUpcomingReservations(all);
+      return buildAppointmentsToolResult(futuras, all.length - futuras.length, action);
+    },
+
+    async getAvailability(args) {
+      {
+        const heldNow = await loadConversationState(chatId);
+        if (
+          heldNow.hora &&
+          heldNow.fecha &&
+          heldNow.profesional &&
+          heldNow.servicio &&
+          (heldNow.paso === 'confirmar' || heldNow.paso === 'nombre')
+        ) {
+          return {
+            data: {
+              held: true,
+              preserved: true,
+              profesional: heldNow.profesional,
+              servicio: heldNow.servicio,
+              fecha: heldNow.fecha,
+              hora: heldNow.hora,
+              nombre: heldNow.nombre || null,
+              note:
+                'Ya hay un turno trabado. No listes cupos nuevos ni pises el draft. Pedí confirmación o cambios explícitos (otra hora → hold_slot).',
+            },
+            keyboard:
+              heldNow.paso === 'confirmar'
+                ? buildAgentConfirmKeyboard(Boolean(heldNow.rescheduleId))
+                : [[BTN.CANCEL_FLOW], [BTN.MENU]],
+          };
+        }
+      }
+      const profesionales = await getProfesionales();
+      const serviciosList = await getServiciosList();
+      const servicioNombres = serviciosList.map(s => s.nombre);
+      const draft = await loadConversationState(chatId);
+
+      const profesionalFilter = args.profesional
+        ? profesionales.find(p => matchesLoosely(p, args.profesional!))
+        : draft.profesional
+          ? profesionales.find(p => matchesLoosely(p, draft.profesional!))
+          : undefined;
+      const servicioFilter = args.servicio
+        ? serviciosList.find(s => matchesLoosely(s.nombre, args.servicio!))?.nombre
+        : draft.servicio
+          ? serviciosList.find(s => matchesLoosely(s.nombre, draft.servicio!))?.nombre
+          : undefined;
+
+      const fecha =
+        args.fecha && /^\d{4}-\d{2}-\d{2}$/.test(args.fecha)
+          ? args.fecha
+          : args.fecha
+            ? parseFecha(args.fecha)
+            : null;
+
+      const toMins = (h: string) => {
+        const [hh, mm] = h.split(':').map(Number);
+        return hh * 60 + (mm || 0);
+      };
+
+      const filterSlots = (slots: string[]) => {
+        let out = slots;
+        if (args.franja) {
+          out = out.filter(h =>
+            args.franja === 'tarde' ? toMins(h) >= 14 * 60 : toMins(h) < 14 * 60
+          );
+        }
+        if (args.horaDesde) {
+          const from = toMins(args.horaDesde);
+          out = out.filter(h => toMins(h) >= from);
+        }
+        if (args.horaHasta) {
+          const to = toMins(args.horaHasta);
+          // slot debe empezar antes del fin de ventana
+          out = out.filter(h => toMins(h) < to);
+        }
+        return out;
+      };
+
+      const dias = await proximosDiasLaborables(6, profesionalFilter, servicioFilter);
+      const diasKeyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+      for (let i = 0; i < Math.min(dias.length, 6); i += 2) {
+        diasKeyboard.push(
+          dias.slice(i, i + 2).map(d => ({
+            text: `📅 ${d.label}`,
+            callback_data: `fecha:${d.fecha}`,
+          }))
+        );
+      }
+      diasKeyboard.push([BTN.MENU]);
+
+      if (!fecha) {
+        return {
+          data: {
+            fecha: null,
+            need: { fecha: true },
+            upcomingDays: dias,
+            note: 'Pedí la fecha al paciente o pasá fecha YYYY-MM-DD.',
+          },
+          keyboard: diasKeyboard,
+          // Importante: deja el draft en "fecha" para que "lunes 20" no caiga al menú
+          sideEffect: {
+            type: 'set_draft',
+            draft: {
+              paso: 'fecha',
+              ...(profesionalFilter ? { profesional: profesionalFilter } : {}),
+              ...(servicioFilter ? { servicio: servicioFilter } : {}),
+              ...(draft.nombre ? { nombre: draft.nombre } : {}),
+            },
+          },
+        };
+      }
+
+      if (await isFeriado(fecha)) {
+        return {
+          data: {
+            fecha,
+            fechaLabel: formatDateAR(fecha),
+            weekday: DAY_NAMES[dayOfWeekFromFechaStr(fecha)],
+            feriado: true,
+            closedReason: 'feriado',
+            options: [],
+            upcomingDays: dias,
+          },
+          keyboard: diasKeyboard,
+          sideEffect: {
+            type: 'set_draft',
+            draft: { paso: 'fecha', ...(profesionalFilter ? { profesional: profesionalFilter } : {}), ...(servicioFilter ? { servicio: servicioFilter } : {}) },
+          },
+        };
+      }
+
+      const profs = profesionalFilter ? [profesionalFilter] : profesionales;
+      const servs = servicioFilter ? [servicioFilter] : servicioNombres;
+      const options: Array<{
+        profesional: string;
+        servicio: string;
+        slots: string[];
+        closed?: boolean;
+        dayName?: string;
+      }> = [];
+
+      for (const p of profs) {
+        const laborable = await esDiaLaborable(fecha, p);
+        if (!laborable) {
+          options.push({
+            profesional: p,
+            servicio: servs[0] || '',
+            slots: [],
+            closed: true,
+            dayName: DAY_NAMES[dayOfWeekFromFechaStr(fecha)],
+          });
+          continue;
+        }
+        for (const s of servs) {
+          const slots = filterSlots(await obtenerHorariosLibres(fecha, p, s));
+          if (slots.length > 0) {
+            options.push({ profesional: p, servicio: s, slots });
+          }
+        }
+      }
+
+      const openOptions = options.filter(o => o.slots.length > 0);
+      const serviciosConCupo = [...new Set(openOptions.map(o => o.servicio))];
+      // No asumir Quiropraxia: si el paciente no eligió servicio y hay más de uno, pedir elección
+      const needServiceChoice = !servicioFilter && serviciosConCupo.length > 1;
+
+      let recommendation: {
+        profesional: string;
+        servicio: string;
+        hora: string;
+        reason: string;
+      } | null = null;
+
+      if (args.horaPreferida) {
+        const pref = args.horaPreferida;
+        const exactMatches = openOptions.filter(o => o.slots.includes(pref));
+        if (exactMatches.length === 1) {
+          recommendation = {
+            profesional: exactMatches[0].profesional,
+            servicio: exactMatches[0].servicio,
+            hora: pref,
+            reason: 'hora_exacta',
+          };
+        } else if (exactMatches.length > 1 && !needServiceChoice) {
+          recommendation = {
+            profesional: exactMatches[0].profesional,
+            servicio: exactMatches[0].servicio,
+            hora: pref,
+            reason: 'hora_exacta',
+          };
+        } else if (exactMatches.length === 0 && openOptions.length > 0 && !needServiceChoice) {
+          let best: { o: (typeof openOptions)[0]; hora: string; dist: number } | null = null;
+          const prefM = toMins(pref);
+          for (const o of openOptions) {
+            for (const h of o.slots) {
+              const dist = Math.abs(toMins(h) - prefM);
+              if (!best || dist < best.dist) best = { o, hora: h, dist };
+            }
+          }
+          if (best) {
+            recommendation = {
+              profesional: best.o.profesional,
+              servicio: best.o.servicio,
+              hora: best.hora,
+              reason: 'hora_cercana',
+            };
+          }
+        }
+      } else if (openOptions.length > 0 && !needServiceChoice) {
+        const first = openOptions[0];
+        recommendation = {
+          profesional: first.profesional,
+          servicio: first.servicio,
+          hora: first.slots[0],
+          reason: 'primera_opcion_en_ventana',
+        };
+      }
+
+      // No auto-hold: Gemini debe llamar hold_slot cuando el paciente ELIGE la hora.
+      const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+      if (needServiceChoice) {
+        for (const s of serviciosConCupo) {
+          const idx = serviciosList.findIndex(x => x.nombre === s);
+          if (idx >= 0) {
+            keyboard.push([{ text: `🩺 ${s}`, callback_data: `servicio_idx:${idx}` }]);
+          }
+        }
+      } else if (recommendation) {
+        const slotsForRec =
+          openOptions.find(
+            o =>
+              o.profesional === recommendation!.profesional &&
+              o.servicio === recommendation!.servicio
+          )?.slots || [recommendation.hora];
+        for (let i = 0; i < Math.min(slotsForRec.length, 9); i += 3) {
+          keyboard.push(
+            slotsForRec.slice(i, i + 3).map(h => ({
+              text: `🕐 ${h}`,
+              callback_data: `hora:${h}`,
+            }))
+          );
+        }
+      } else if (openOptions.length === 0) {
+        for (let i = 0; i < Math.min(dias.length, 6); i += 2) {
+          keyboard.push(
+            dias.slice(i, i + 2).map(d => ({
+              text: `📅 ${d.label}`,
+              callback_data: `fecha:${d.fecha}`,
+            }))
+          );
+        }
+      }
+      keyboard.push([BTN.MENU]);
+
+      const sideEffect =
+        recommendation && !needServiceChoice
+          ? {
+              type: 'set_draft' as const,
+              draft: {
+                paso: 'hora' as const,
+                profesional: recommendation.profesional,
+                servicio: recommendation.servicio,
+                fecha,
+                ...(draft.nombre ? { nombre: draft.nombre } : {}),
+              },
+            }
+          : {
+              type: 'set_draft' as const,
+              draft: {
+                paso: needServiceChoice ? ('servicio' as const) : ('fecha' as const),
+                ...(profesionalFilter ? { profesional: profesionalFilter } : {}),
+                ...(servicioFilter ? { servicio: servicioFilter } : {}),
+                fecha,
+                ...(draft.nombre ? { nombre: draft.nombre } : {}),
+              },
+            };
+
+      const matchesAtHora =
+        args.horaPreferida && needServiceChoice
+          ? openOptions
+              .filter(o => o.slots.includes(args.horaPreferida!))
+              .map(o => ({
+                profesional: o.profesional,
+                servicio: o.servicio,
+                hora: args.horaPreferida!,
+              }))
+          : [];
+
+      return {
+        data: {
+          fecha,
+          fechaLabel: formatDateAR(fecha),
+          weekday: DAY_NAMES[dayOfWeekFromFechaStr(fecha)],
+          window: {
+            horaDesde: args.horaDesde || null,
+            horaHasta: args.horaHasta || null,
+            horaPreferida: args.horaPreferida || null,
+            franja: args.franja || null,
+          },
+          options: openOptions.map(o => ({
+            profesional: o.profesional,
+            servicio: o.servicio,
+            slots: o.slots,
+          })),
+          closedProfessionals: options
+            .filter(o => o.closed)
+            .map(o => ({ profesional: o.profesional, dayName: o.dayName })),
+          recommendation,
+          needServiceChoice,
+          serviciosConCupo,
+          matchesAtHora,
+          note: needServiceChoice
+            ? 'El paciente NO eligió servicio. Preguntá cuál quiere en 1-2 líneas. NO listés servicios ni todos los horarios en el texto (van en botones). recommendation no es una elección del paciente. Formato: contexto breve + "Tocá el servicio 👇".'
+            : 'Escribí 1-2 líneas. Máximo 1 ejemplo de hora/profesional. NO enumerés todos los slots (van en botones). CTA: "Elegí un horario 👇".',
+          requestedHoraAvailable: args.horaPreferida
+            ? openOptions.some(o => o.slots.includes(args.horaPreferida!))
+            : null,
+          count: openOptions.reduce((n, o) => n + o.slots.length, 0),
+          upcomingDays: openOptions.length === 0 ? dias : [],
+        },
+        keyboard,
+        sideEffect,
+      };
+    },
+  };
+}
+
+async function showMisReservas(
+  chatId: number,
+  sendWithKeyboard: (text: string, keyboard: any) => Promise<void>,
+  opts?: {
+    mode?: MisReservasMode;
+    saveState?: (patch: StatePatch) => Promise<void>;
+    userText?: string;
+  }
+) {
+  const mode = opts?.mode || 'status';
+  const reservasArray = await loadUserReservations(chatId);
+
+  if (reservasArray.length === 0) {
+    await sendWithKeyboard(buildTurnoStatusMessage([]), [
+      [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
+      [BTN.MENU],
+    ]);
+    return;
+  }
+
+  const { keyboard, futuras, pastCount } = await buildMisReservasKeyboard(reservasArray);
+  if (futuras.length === 0) {
+    await sendWithKeyboard(buildTurnoStatusMessage([], { pastCount }), [
+      [BTN.RESERVAR],
+      [BTN.MENU],
+    ]);
+    return;
+  }
+
+  if (mode === 'change' && opts?.saveState) {
+    if (futuras.length === 1) {
+      await startRescheduleForReserva(futuras[0], opts.saveState, sendWithKeyboard);
+      return;
+    }
+    await sendWithKeyboard(
+      `🔄 *Cambiar turno*\n\nTenés *${futuras.length} turnos*. ¿Cuál querés cambiar?`,
+      keyboard
+    );
+    return;
+  }
+
+  if (mode === 'cancel') {
+    if (futuras.length === 1) {
+      await showCancelConfirm(futuras[0], sendWithKeyboard);
+      return;
+    }
+    await sendWithKeyboard(
+      `❌ *Cancelar turno*\n\nTenés *${futuras.length} turnos*. ¿Cuál querés cancelar?`,
+      keyboard
+    );
+    return;
+  }
+
+  const focus = opts?.userText && isTimeUntilIntent(opts.userText) ? 'time_until' : 'status';
+  await sendWithKeyboard(buildTurnoStatusMessage(futuras, { pastCount, focus }), keyboard);
 }
 
 function formatDateShortSafe(fechaStr: string): string {
@@ -1658,20 +3560,21 @@ export async function POST(request: NextRequest) {
       // ── Manejar callbacks ────────────────────────────────────────────
       if (data === 'menu') {
         await clearState();
+        await clearGeminiHistory(String(chatId));
         await sendWithKeyboard(WELCOME_MESSAGE, MAIN_MENU_KEYBOARD);
 
       } else if (data === 'profesionales') {
         await sendWithKeyboard(
-          '👨‍⚕️ *Nuestros profesionales*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar, o elegí al azar:',
+          '👨‍⚕️ *Nuestros profesionales*\n\n*(Atención particular, sin obra social)*\n\nTocá uno para reservar 👇',
           await buildProfesionalesKeyboard()
         );
       } else if (data === 'servicios') {
         const servicios = await getServiciosList();
         const list = servicios
-          .map(s => `• *${s.nombre}* — ${formatPriceAR(s.precio)} (${s.duracionMinutos} min)`)
+          .map(s => `• *${s.nombre}* — ${formatPriceAR(s.precio)} · ${s.duracionMinutos} min`)
           .join('\n');
         await sendWithKeyboard(
-          `🩺 *Servicios disponibles*\n\n*(Atención particular, sin obra social)*\n\n${list}\n\nTocá uno para reservarlo:`,
+          `🩺 *Servicios*\n\n*(Atención particular, sin obra social)*\n\n${list}\n\nTocá uno para reservar 👇`,
           await buildServiciosKeyboard(false)
         );
 
@@ -1679,71 +3582,43 @@ export async function POST(request: NextRequest) {
         const limitReached = await checkReservationLimit(chatId);
         if (limitReached) {
           await sendWithKeyboard(
-            '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos permitidos. Para reservar uno nuevo, primero tenés que cancelar alguno desde tus reservas.',
+            buildLimitReachedMessage(MAX_RESERVACIONES_POR_USUARIO),
             [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
           );
         } else {
-          // Profesional → servicio → nombre → fecha → hora
-          await startBookingWithProfessional(
-            saveState,
-            sendWithKeyboard,
-            '¡Dale! Elegí el profesional y después armamos el turno:'
+          // Mismo camino que texto: cupos primero, sin wizard profesional→servicio
+          await replyWithAvailabilityTool(chatId, { saveState, sendWithKeyboard });
+        }
+
+      } else if (data === 'rebook_last') {
+        const limitReached = await checkReservationLimit(chatId);
+        if (limitReached) {
+          await sendWithKeyboard(
+            buildLimitReachedMessage(MAX_RESERVACIONES_POR_USUARIO),
+            [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
           );
+        } else {
+          const profile = await getUserProfile(chatId, kv);
+          if (!profile?.lastProfesional || !profile?.lastServicio) {
+            await replyWithAvailabilityTool(chatId, { saveState, sendWithKeyboard });
+          } else {
+            const step = await buildNombreStep(
+              {
+                paso: 'nombre',
+                profesional: profile.lastProfesional,
+                servicio: profile.lastServicio,
+                nombre: profile.nombre,
+              },
+              chatId,
+              `🔁 Repetimos *${profile.lastServicio}* con *${profile.lastProfesional}*\n\n`
+            );
+            await saveState(step.estado);
+            await sendWithKeyboard(step.text, step.keyboard);
+          }
         }
 
       } else if (data === 'misreservas') {
-        let reservasArray: Reservation[] = [];
-
-        if (kv) {
-          const userReservasKey = `user:${chatId}:reservas`;
-          const userReservas = await kv.get(userReservasKey) || [];
-          let rawArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
-          
-          // Self-healing: verificar que las reservas realmente existan
-          const validReservations = [];
-          let changed = false;
-          for (const r of rawArray) {
-            const exists = await kv.get(`reserva:id:${r.id}`);
-            if (exists) {
-              validReservations.push(r);
-            } else {
-              changed = true; // Se encontró una reserva huérfana
-            }
-          }
-          
-          if (changed) {
-            await kv.set(userReservasKey, JSON.stringify(validReservations));
-          }
-          reservasArray = validReservations;
-        } else {
-          const localReservations = getLocalReservations();
-          reservasArray = localReservations.filter(r => r.chatId === chatId);
-        }
-
-        if (reservasArray.length === 0) {
-          await sendWithKeyboard(
-            'Todavía no tenés reservas. ¿Querés hacer una?',
-            [
-              [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
-              [BTN.MENU]
-            ]
-          );
-        } else {
-          const { keyboard, futuras, pastCount } = await buildMisReservasKeyboard(reservasArray);
-          if (futuras.length === 0) {
-            await sendWithKeyboard(
-              pastCount > 0
-                ? 'No tenés turnos próximos. ¿Querés reservar uno nuevo?'
-                : 'Todavía no tenés reservas. ¿Querés hacer una?',
-              [[BTN.RESERVAR], [BTN.MENU]]
-            );
-          } else {
-            await sendWithKeyboard(
-              `📋 *Tus turnos*\n\nTocá *Cambiar* o *Cancelar* en cada uno.${pastCount > 0 ? `\n_(${pastCount} turno${pastCount > 1 ? 's' : ''} pasado${pastCount > 1 ? 's' : ''} oculto${pastCount > 1 ? 's' : ''})_` : ''}`,
-              keyboard
-            );
-          }
-        }
+        await showMisReservas(chatId, sendWithKeyboard);
 
       } else if (data.startsWith('ver_reserva:')) {
         const reservaId = data.replace('ver_reserva:', '');
@@ -1783,17 +3658,7 @@ export async function POST(request: NextRequest) {
         if (!reserva) {
           await sendWithKeyboard('No encontré esa reserva.', [[BTN.MENU]]);
         } else {
-          await saveState({
-            paso: 'fecha',
-            rescheduleId: reservaId,
-            profesional: reserva.profesional,
-            servicio: reserva.servicio,
-            nombre: reserva.nombre,
-            fecha: reserva.fecha,
-            hora: reserva.hora,
-          });
-          const view = await buildFechasView(reserva.servicio, reserva.profesional);
-          await sendWithKeyboard(`🔄 *Cambiar turno*\n\n${view.text}`, view.keyboard);
+          await startRescheduleForReserva(reserva, saveState, sendWithKeyboard);
         }
 
       } else if (data.startsWith('confirmar_eliminar:')) {
@@ -1802,17 +3667,7 @@ export async function POST(request: NextRequest) {
         if (!reserva) {
           await sendWithKeyboard('No encontré esa reserva.', [[BTN.MIS_RESERVAS], [BTN.MENU]]);
         } else {
-          await sendWithKeyboard(
-            `⚠️ *¿Cancelar este turno?*\n\n` +
-              `👨‍⚕️ ${reserva.profesional}\n` +
-              `🩺 ${reserva.servicio}\n` +
-              `📅 ${formatDate(reserva.fecha)} · ${reserva.hora}\n\n` +
-              `Esta acción no se puede deshacer.`,
-            [
-              [{ text: '✅ Sí, cancelar turno', callback_data: `eliminar:${reservaId}` }],
-              [{ text: '↩️ Volver', callback_data: 'misreservas' }]
-            ]
-          );
+          await showCancelConfirm(reserva, sendWithKeyboard);
         }
 
       } else if (data.startsWith('eliminar:')) {
@@ -1903,6 +3758,10 @@ export async function POST(request: NextRequest) {
       } else if (data === 'usar_nombre') {
         if (!estado.nombre || !estado.servicio || !estado.profesional) {
           await sendWithKeyboard('Sigamos desde el principio:', await buildProfesionalesKeyboard());
+        } else if (estado.fecha && estado.hora) {
+          await saveState({ ...estado, paso: 'confirmar' });
+          const view = await buildConfirmacionView(estado);
+          await sendWithKeyboard(`Perfecto, *${estado.nombre}* 👋\n\n${view.text}`, view.keyboard);
         } else {
           await saveState({ ...estado, paso: 'fecha' });
           const view = await buildFechasView(estado.servicio, estado.profesional);
@@ -1989,49 +3848,14 @@ export async function POST(request: NextRequest) {
         const servicioSeleccionado = await resolveServicioFromCallback(data);
         if (!servicioSeleccionado) {
           await sendWithKeyboard('No pude reconocer ese servicio. Probá de nuevo:', await buildServiciosKeyboard(true));
-        } else if (!estado.profesional) {
-          const limitReached = await checkReservationLimit(chatId);
-          if (limitReached && !estado.paso) {
-            await sendWithKeyboard(
-              '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos. Cancelá uno desde Mis reservas.',
-              [[BTN.MIS_RESERVAS], [BTN.MENU]]
-            );
-          } else {
-            // Sin profesional aún → pedirlo (servicio ya queda guardado)
-            await saveState({
-              paso: 'profesional',
-              servicio: servicioSeleccionado,
-              clear: ['profesional', 'fecha', 'hora'],
-            });
-            await sendWithKeyboard(
-              withFlowProgress(
-                'profesional',
-                `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`
-              ),
-              await buildProfesionalesKeyboard(servicioSeleccionado)
-            );
-          }
-        } else if ((estado.nombre || estado.rescheduleId) && estado.fecha) {
-          await saveState({ ...estado, paso: 'hora', servicio: servicioSeleccionado });
-          const view = await buildHorariosView(
-            estado.fecha,
-            servicioSeleccionado,
-            estado.profesional,
-            estado.rescheduleId
-          );
-          await sendWithKeyboard(view.text, view.keyboard);
-        } else if (estado.nombre || estado.rescheduleId) {
-          await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado });
-          const view = await buildFechasView(servicioSeleccionado, estado.profesional);
-          await sendWithKeyboard(`Hola *${estado.nombre}* 👋\n\n${view.text}`, view.keyboard);
         } else {
-          const step = await buildNombreStep(
-            { ...estado, servicio: servicioSeleccionado },
+          await applyServicioSelection(
             chatId,
-            `*${servicioSeleccionado}* ✔️\n\n`
+            estado,
+            servicioSeleccionado,
+            saveState,
+            sendWithKeyboard
           );
-          await saveState(step.estado);
-          await sendWithKeyboard(step.text, step.keyboard);
         }
 
       } else if (data === 'cambiar_fecha') {
@@ -2046,14 +3870,24 @@ export async function POST(request: NextRequest) {
             rescheduleId: estado.rescheduleId,
             clear: ['fecha', 'hora'],
           });
-          const view = await buildFechasView(estado.servicio, estado.profesional);
+          const view = await buildFechasView(estado.servicio, estado.profesional, estado.rescheduleId);
           await sendWithKeyboard(view.text, view.keyboard);
         }
 
       } else if (data.startsWith('fecha:')) {
         const fechaSeleccionada = data.replace('fecha:', '');
         if (!estado.servicio || !estado.profesional) {
-          await promptMissingProfOrServicio(estado, saveState, sendWithKeyboard);
+          await saveState({
+            ...estado,
+            paso: 'fecha',
+            fecha: fechaSeleccionada,
+            clear: ['hora'],
+          });
+          await replyWithAvailabilityTool(chatId, {
+            fecha: fechaSeleccionada,
+            saveState,
+            sendWithKeyboard,
+          });
         } else {
           await saveState({
             paso: 'hora',
@@ -2086,6 +3920,40 @@ export async function POST(request: NextRequest) {
 
       } else if (data.startsWith('hora:')) {
         const horaSeleccionada = data.replace('hora:', '');
+
+        if (!estado.profesional || !estado.servicio) {
+          const handlers = makeAssistantHandlers(chatId);
+          const tool = await handlers.getAvailability({
+            fecha: estado.fecha,
+            horaPreferida: horaSeleccionada,
+          });
+          if (tool.sideEffect?.type === 'set_draft') {
+            const d = tool.sideEffect.draft;
+            await mergeDraftFromSideEffect(saveState, d);
+            const merged = { ...estado, ...d };
+            if (d.paso === 'confirmar' && d.hora && d.profesional && d.servicio) {
+              const view = await buildConfirmacionView(merged);
+              await sendWithKeyboard(view.text, view.keyboard);
+              return NextResponse.json({ status: 'ok' });
+            }
+            if (d.paso === 'nombre' && d.hora) {
+              await sendWithKeyboard(
+                'Dale, ¿a nombre de quién reservo el turno?\n\nEscribí tu nombre (ej: *María López*).',
+                FLOW_CANCEL_KEYBOARD
+              );
+              return NextResponse.json({ status: 'ok' });
+            }
+          }
+          await sendWithKeyboard(
+            buildAvailabilityFallbackMessage(
+              estado.fecha ?? null,
+              (tool.data || {}) as AvailabilityToolData
+            ),
+            tool.keyboard && tool.keyboard.length > 0 ? tool.keyboard : ASSIST_KEYBOARD
+          );
+          return NextResponse.json({ status: 'ok' });
+        }
+
         const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
 
         const disponibilidad = await verificarDisponibilidad(
@@ -2097,9 +3965,13 @@ export async function POST(request: NextRequest) {
         );
 
         if (disponibilidad.disponible) {
-          await saveState({ ...estado, paso: 'confirmar', hora: horaSeleccionada });
-          const view = await buildConfirmacionView({ ...estado, hora: horaSeleccionada });
-          await sendWithKeyboard(view.text, view.keyboard);
+          await proceedAfterSlotChosen(
+            chatId,
+            estado,
+            horaSeleccionada,
+            saveState,
+            sendWithKeyboard
+          );
         } else {
           const viewActualizada = await buildHorariosView(
             estado.fecha!,
@@ -2165,6 +4037,25 @@ export async function POST(request: NextRequest) {
         }
 
       } else if (data === 'confirmar_reserva') {
+        const nombreOk = await resolvePatientNombre(chatId, estado);
+        if (!nombreOk || !estado.fecha || !estado.hora || !estado.profesional || !estado.servicio) {
+          if (estado.fecha && estado.hora && estado.profesional && estado.servicio) {
+            await proceedAfterSlotChosen(
+              chatId,
+              estado,
+              estado.hora,
+              saveState,
+              sendWithKeyboard
+            );
+          } else {
+            await sendWithKeyboard(
+              'Me faltan datos para confirmar. ¿Empezamos de nuevo?',
+              ASSIST_KEYBOARD
+            );
+          }
+          return NextResponse.json({ status: 'ok' });
+        }
+
         // Verificar disponibilidad de nuevo (pudo ocuparse mientras confirmaba)
         const disponibilidad = await verificarDisponibilidad(estado.profesional!, estado.servicio!, estado.fecha!, estado.hora!);
 
@@ -2172,7 +4063,7 @@ export async function POST(request: NextRequest) {
           const datosReserva = {
             profesional: estado.profesional!,
             servicio: estado.servicio!,
-            nombre: estado.nombre!,
+            nombre: nombreOk,
             fecha: estado.fecha!,
             hora: estado.hora!,
             chatId: chatId
@@ -2251,7 +4142,7 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(WELCOME_MESSAGE, MAIN_MENU_KEYBOARD);
       };
 
-      const showInfoResponse = async (infoType: 'obra_social' | 'horarios' | 'precios' | 'ubicacion') => {
+      const showInfoResponse = async (infoType: InfoQueryType) => {
         if (infoType === 'obra_social') {
           await sendWithKeyboard(
             '🏥 *Obra social*\n\nEn este momento *no recibimos obra social*. La atención es *particular*.\n\nSi querés, puedo mostrarte servicios, horarios o ayudarte a reservar un turno.',
@@ -2261,6 +4152,17 @@ export async function POST(request: NextRequest) {
           await sendWithKeyboard(await buildHorariosInfoMessage(), ASSIST_KEYBOARD);
         } else if (infoType === 'ubicacion') {
           await sendWithKeyboard(buildLocationMessage(), ASSIST_KEYBOARD);
+        } else if (infoType === 'pago') {
+          await sendWithKeyboard(buildFaqPagoMessage(), ASSIST_KEYBOARD);
+        } else if (infoType === 'cancelacion') {
+          await sendWithKeyboard(buildFaqCancelacionMessage(), ASSIST_KEYBOARD);
+        } else if (infoType === 'que_traer') {
+          await sendWithKeyboard(buildFaqQueTraerMessage(), ASSIST_KEYBOARD);
+        } else if (infoType === 'estacionamiento') {
+          await sendWithKeyboard(buildFaqEstacionamientoMessage(), ASSIST_KEYBOARD);
+        } else if (infoType === 'duracion') {
+          const servicios = await getServiciosList();
+          await sendWithKeyboard(buildFaqDuracionMessage(servicios), ASSIST_KEYBOARD);
         } else {
           // Precios = catálogo accionable: el usuario toca el servicio que quiere
           await sendWithKeyboard(
@@ -2343,31 +4245,340 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      // Respuestas fijas (sin IA): menú, info y catálogos → siempre el mismo formato
+      // Gemini puro: el texto siempre lo escribe el modelo. Botones = atajos (callbacks).
       const quickLocal = parseLocalIntent(text);
-      if (!estado?.paso) {
-        if (quickLocal?.action === 'menu') {
+
+      // Menú / reset explícito → limpia draft + historial Gemini
+      if (isExplicitMenuCommand(text)) {
+        await clearState();
+        await clearGeminiHistory(String(chatId));
+        await showMainMenu();
+        return NextResponse.json({ status: 'ok' });
+      }
+
+      // Saludo: reset solo si no hay reserva en curso (no perder draft mid-booking)
+      let draftForAgent = estado || {};
+      if (isGreetingOrChatReset(text)) {
+        if (!estado?.paso) {
           await clearState();
-          await showMainMenu();
+          await clearGeminiHistory(String(chatId));
+          estado = { paso: null };
+          draftForAgent = {};
+        }
+      } else if (estado?.paso && isAbortBookingIntent(text) && !isMisReservasIntent(text)) {
+        await clearState();
+        await clearGeminiHistory(String(chatId));
+        estado = { paso: null };
+        draftForAgent = {};
+      }
+
+      // Texto libre → Gemini (prosa + tools). Callbacks de botones siguen en el branch de callback_query.
+      // Fallbacks locales (servicio/profesional/confirm/fecha/hora) solo si viaLlm=false más abajo.
+
+      const flowCtx = { saveState, sendWithKeyboard };
+
+      // Gemini primero: interpreta prosa. Plantillas locales solo si el LLM falla.
+      {
+        const profile = await getUserProfile(chatId, kv);
+        const history = await getChatHistory(chatId, kv);
+
+        const assistantResult = await runAssistantTurn({
+          userMessage: text,
+          chatId,
+          historyText: formatChatHistoryForPrompt(history),
+          clinicContext: await buildClinicContextForAI(),
+          draft: draftForAgent,
+          profileSummary: profile
+            ? `nombre=${profile.nombre || '-'}, ultimoTurno=${profile.lastProfesional || '-'}/${profile.lastServicio || '-'} (solo si pide repetir)`
+            : undefined,
+          handlers: makeAssistantHandlers(chatId),
+        });
+
+        if (
+          await dispatchAssistantTurnResult(chatId, assistantResult, {
+            saveState,
+            sendWithKeyboard,
+            clearState,
+            draft: draftForAgent,
+          })
+        ) {
+          // Si Gemini habló del nombre pero no llamó la tool, forzar persistencia
+          const needsName =
+            (draftForAgent?.paso === 'nombre' ||
+              (draftForAgent?.hora &&
+                draftForAgent?.fecha &&
+                draftForAgent?.profesional &&
+                draftForAgent?.servicio &&
+                !sanitizePersonName(draftForAgent?.nombre))) &&
+            extractPersonName(text) &&
+            !assistantResult.usedTools.includes('set_patient_name');
+          if (needsName) {
+            await handleFlowNombreInput(chatId, { ...draftForAgent, paso: 'nombre' }, text, {
+              saveState,
+              sendWithKeyboard,
+            });
+          }
           return NextResponse.json({ status: 'ok' });
         }
 
-        if (quickLocal?.action === 'profesionales') {
-          await clearState();
-          await showProfesionalesCatalog(isProfessionalsQuestion(text) ? 'info' : 'booking');
+        // Fallback solo si Gemini falló: no inventar prosa de plantilla
+        // Mis reservas gana aunque haya draft a medias (no empujar "¿para qué día?")
+        if (isMisReservasIntent(text) || quickLocal?.action === 'misreservas') {
+          await showMisReservas(chatId, sendWithKeyboard, {
+            mode: getMisReservasMode(text),
+            saveState,
+            userText: text,
+          });
           return NextResponse.json({ status: 'ok' });
         }
 
-        if (quickLocal?.action === 'servicios') {
-          await clearState();
-          await showServiciosCatalog();
+        // FAQ / horario de atención: no empujar menú de servicios
+        if (isClinicScheduleQuestion(text) || parseInfoQuery(text) === 'horarios') {
+          await showInfoResponse('horarios');
           return NextResponse.json({ status: 'ok' });
         }
 
-        const infoQuery = parseInfoQuery(text);
-        if (infoQuery) {
-          await clearState();
-          await showInfoResponse(infoQuery);
+        // Solo cupos si pide turno NUEVO de forma clara (nunca por draft residual)
+        const fechaHint = parseFecha(text);
+        // Cupos solo con señal clara de RESERVAR. "mañana" en una FAQ de horarios NO cuenta.
+        const infoQ = parseInfoQuery(text);
+        const wantsCupos =
+          !hasHeldBookingSlot(estado) &&
+          estado?.paso !== 'confirmar' &&
+          estado?.paso !== 'nombre' &&
+          !isClinicScheduleQuestion(text) &&
+          infoQ !== 'horarios' &&
+          (looksLikeAvailabilityQuestion(text) ||
+            containsBookingIntent(text) ||
+            (Boolean(fechaHint) && !looksLikeQuestion(text)));
+
+        if (wantsCupos) {
+          await replyWithAvailabilityTool(chatId, {
+            fecha: fechaHint || estado?.fecha || undefined,
+            saveState,
+            sendWithKeyboard,
+          });
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        // Gemini falló mid-flow: saludo sin reset
+        if (estado?.paso && isGreetingOrChatReset(text)) {
+          const contextKeyboard = await getContextualKeyboard(estado);
+          const resumeHint = estado.fecha
+            ? `Seguimos con tu turno del *${formatDateAR(estado.fecha)}*${estado.hora ? ` a las *${estado.hora}*` : ''}.`
+            : 'Seguimos con tu reserva cuando quieras.';
+          await sendWithKeyboard(resumeHint, contextKeyboard);
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        // Gemini falló mid-flow: FAQ estática antes de pedir repetir
+        if (estado?.paso && looksLikeQuestion(text)) {
+          const consultaInfo = parseInfoQuery(text);
+          if (consultaInfo) {
+            await showInfoResponse(consultaInfo);
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+
+        // Gemini falló: pasos locales (fecha/hora/nombre/servicio/profesional/confirm) como red de seguridad
+        if (estado?.paso === 'fecha' && isValidFlowInput(text, 'fecha')) {
+          if (await handleFlowFechaInput(chatId, estado, text, flowCtx)) {
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+        if (estado?.paso === 'hora' && isValidFlowInput(text, 'hora')) {
+          if (await handleFlowHoraInput(chatId, estado, text, flowCtx)) {
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+
+        if (estado?.paso === 'nombre') {
+          if (await handleFlowNombreInput(chatId, estado, text, flowCtx)) {
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+        if (
+          !sanitizePersonName(estado?.nombre) &&
+          estado?.hora &&
+          estado?.fecha &&
+          estado?.profesional &&
+          estado?.servicio &&
+          estado.paso !== 'profesional' &&
+          estado.paso !== 'servicio' &&
+          estado.paso !== 'fecha' &&
+          extractPersonName(text)
+        ) {
+          if (
+            await handleFlowNombreInput(
+              chatId,
+              { ...estado, paso: 'nombre' },
+              text,
+              flowCtx
+            )
+          ) {
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+
+        if (
+          estado?.paso === 'servicio' &&
+          !looksLikeQuestion(text) &&
+          !parseFecha(text) &&
+          !looksLikeHoraInput(text)
+        ) {
+          const servicios = await getServiciosList();
+          const servicioSeleccionado = matchServicioFromText(text, servicios);
+          if (servicioSeleccionado) {
+            await applyServicioSelection(
+              chatId,
+              estado,
+              servicioSeleccionado,
+              saveState,
+              sendWithKeyboard
+            );
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+
+        if (estado?.paso === 'profesional' && !looksLikeQuestion(text) && !parseFecha(text)) {
+          const profesionales = await getProfesionales();
+          const normalized = normalizeHumanText(text);
+          let profSeleccionado: string | null = null;
+          if (
+            ['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w =>
+              normalized.includes(w)
+            )
+          ) {
+            profSeleccionado =
+              profesionales[Math.floor(Math.random() * profesionales.length)] || null;
+          } else {
+            const num = parseInt(text, 10);
+            if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
+              profSeleccionado = profesionales[num - 1];
+            } else {
+              profSeleccionado = profesionales.find(p => matchesLoosely(p, text)) || null;
+            }
+          }
+          if (profSeleccionado) {
+            await continueAfterProfessional(
+              chatId,
+              estado,
+              profSeleccionado,
+              saveState,
+              sendWithKeyboard,
+              `*${profSeleccionado}* ✔️\n\n`
+            );
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+
+        if (estado?.paso === 'confirmar' && estado.hora && estado.fecha) {
+          const normalizedConfirm = normalizeHumanText(text);
+          const confirmWords = [
+            'si',
+            'sí',
+            'dale',
+            'confirmar',
+            'confirmo',
+            'ok',
+            'listo',
+            'yes',
+            'bueno',
+            'va',
+          ];
+          const cancelWords = ['no', 'cancelar', 'cancel', 'nop', 'nope'];
+          if (confirmWords.includes(normalizedConfirm)) {
+            const nombreOk = await resolvePatientNombre(chatId, estado);
+            if (!nombreOk) {
+              await proceedAfterSlotChosen(
+                chatId,
+                estado,
+                estado.hora!,
+                saveState,
+                sendWithKeyboard
+              );
+              return NextResponse.json({ status: 'ok' });
+            }
+            const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
+            const disponibilidad = await verificarDisponibilidad(
+              estado.profesional!,
+              estado.servicio!,
+              estado.fecha!,
+              estado.hora!,
+              rescheduleOptions
+            );
+            if (disponibilidad.disponible) {
+              if (estado.rescheduleId) {
+                const reserva = await reprogramarReserva(
+                  chatId,
+                  estado.rescheduleId,
+                  estado.fecha!,
+                  estado.hora!
+                );
+                if (reserva) {
+                  await clearState();
+                  const serv = await getServicio(reserva.servicio);
+                  await sendWithKeyboard(
+                    buildSuccessMessage(reserva, serv, true),
+                    POST_BOOKING_KEYBOARD
+                  );
+                }
+              } else {
+                const reserva = await guardarReserva(chatId, {
+                  profesional: estado.profesional!,
+                  servicio: estado.servicio!,
+                  nombre: nombreOk,
+                  fecha: estado.fecha!,
+                  hora: estado.hora!,
+                  chatId,
+                });
+                if (reserva) {
+                  await clearState();
+                  const serv = await getServicio(reserva.servicio);
+                  await sendWithKeyboard(
+                    buildSuccessMessage(reserva, serv, false),
+                    POST_BOOKING_KEYBOARD
+                  );
+                } else {
+                  const viewActualizada = await buildHorariosView(
+                    estado.fecha!,
+                    estado.servicio!,
+                    estado.profesional!
+                  );
+                  await sendWithKeyboard(
+                    `⚠️ Ese horario acaba de ser reservado.\n\nElegí otro turno:`,
+                    viewActualizada.keyboard
+                  );
+                }
+              }
+            } else {
+              const viewActualizada = await buildHorariosView(
+                estado.fecha!,
+                estado.servicio!,
+                estado.profesional!,
+                estado.rescheduleId
+              );
+              await sendWithKeyboard(
+                `⚠️ ${disponibilidad.mensaje || 'Ese horario ya no está disponible.'}\n\nElegí otro turno:`,
+                viewActualizada.keyboard
+              );
+            }
+            return NextResponse.json({ status: 'ok' });
+          }
+          if (cancelWords.includes(normalizedConfirm)) {
+            await clearState();
+            await sendWithKeyboard('Cancelado. ¿En qué más puedo ayudarte?', ASSIST_KEYBOARD);
+            return NextResponse.json({ status: 'ok' });
+          }
+        }
+
+        // Gemini falló mid-flow sin ser fecha/cupo: no tirar al menú de bienvenida
+        if (estado?.paso) {
+          const contextKeyboard = await getContextualKeyboard(estado);
+          await sendWithKeyboard(
+            'Disculpá, no pude procesar eso. ¿Me lo repetís? También podés usar los botones.',
+            contextKeyboard
+          );
           return NextResponse.json({ status: 'ok' });
         }
       }
@@ -2375,50 +4586,38 @@ export async function POST(request: NextRequest) {
       let aiResult = await resolveTextIntent(text, estado, chatId);
 
       if (aiResult.intent.action === 'consulta') {
-        // Si hay un flujo activo, NO lo interrumpas: respondé y mantené el contexto
-        if (estado?.paso) {
-          const contextKeyboard = await getContextualKeyboard(estado);
-          const answer = aiResult.responseText?.trim()
-            || 'Dale, te cuento: es para dejar la reserva a tu nombre.';
-          const nudge =
-            estado.paso === 'nombre'
-              ? '\n\nCuando puedas, escribí tu nombre para seguir.'
-              : '\n\nSeguimos con la reserva cuando quieras.';
-          await sendWithKeyboard(answer + nudge, contextKeyboard);
-        } else {
-          await clearState();
-          const consultaInfo = parseInfoQuery(text);
-          const responseText = aiResult.responseText?.trim() || '';
-          const mentionsLocation =
-            /monteagudo|tucum[aá]n|ubicaci[oó]n|direcci[oó]n|mapa|d[oó]nde estamos/i.test(responseText);
-          const mentionsProfessionals =
-            /profesional|doctor|francisco|javier|chibilisco|martoni/i.test(responseText) &&
-            !/quiropraxia|masaje relajante|sesi[oó]n premium|\$\s*\d/i.test(responseText);
-          const mentionsServices =
-            /quiropraxia|masaje relajante|sesi[oó]n premium|precio/i.test(responseText);
+        // Sin flujo: si Gemini falló, datos fijos de clínica (no inventar prosa)
+        await clearState();
+        const consultaInfo = parseInfoQuery(text);
+        const responseText = aiResult.responseText?.trim() || '';
+        const mentionsLocation =
+          /monteagudo|tucum[aá]n|ubicaci[oó]n|direcci[oó]n|mapa|d[oó]nde estamos/i.test(responseText);
+        const mentionsProfessionals =
+          /profesional|doctor|francisco|javier|chibilisco|martoni/i.test(responseText) &&
+          !/quiropraxia|masaje relajante|sesi[oó]n premium|\$\s*\d/i.test(responseText);
+        const mentionsServices =
+          /quiropraxia|masaje relajante|sesi[oó]n premium|precio/i.test(responseText);
 
-          // Info fija siempre gana a la prosa de la IA
-          if (consultaInfo === 'ubicacion' || mentionsLocation) {
-            await showInfoResponse('ubicacion');
-          } else if (mentionsProfessionals) {
-            await showProfesionalesCatalog('info');
-          } else if (consultaInfo === 'precios' || mentionsServices) {
-            await showServiciosCatalog();
-          } else if (consultaInfo) {
-            await showInfoResponse(consultaInfo);
-          } else if (responseText) {
-            await sendWithKeyboard(responseText, ASSIST_KEYBOARD);
-          } else {
-            await sendWithKeyboard(
-              'Con gusto te ayudo. Por el momento la atención es *particular* y *no recibimos obra social*.\n\nPodés consultar horarios, servicios o reservar un turno.',
-              ASSIST_KEYBOARD
-            );
-          }
+        if (consultaInfo === 'ubicacion' || mentionsLocation) {
+          await showInfoResponse('ubicacion');
+        } else if (mentionsProfessionals) {
+          await showProfesionalesCatalog('info');
+        } else if (consultaInfo === 'precios' || mentionsServices) {
+          await showServiciosCatalog();
+        } else if (consultaInfo) {
+          await showInfoResponse(consultaInfo);
+        } else if (responseText) {
+          await sendWithKeyboard(responseText, ASSIST_KEYBOARD);
+        } else {
+          await sendWithKeyboard(
+            'Disculpá, no te entendí del todo. ¿Consultás horarios, precios, ubicación o querés un turno?',
+            ASSIST_KEYBOARD
+          );
         }
       } else if (
-        aiResult.intent.action !== 'unknown' &&
-        // Si el mensaje encaja con el paso actual (ej. "15:30"), no reiniciar el flujo
-        !(estado?.paso && (aiResult.shouldContinueWithFlow || isValidFlowInput(text, estado.paso)))
+        // Con flujo activo NUNCA reiniciar reservar/servicios/etc (evita saltos)
+        !estado?.paso &&
+        aiResult.intent.action !== 'unknown'
       ) {
         if (aiResult.intent.action === 'menu') {
           await clearState();
@@ -2428,175 +4627,30 @@ export async function POST(request: NextRequest) {
         } else if (aiResult.intent.action === 'profesionales') {
           await showProfesionalesCatalog(isProfessionalsQuestion(text) ? 'info' : 'booking');
         } else if (aiResult.intent.action === 'misreservas') {
-          let reservasArray: Reservation[] = [];
-
-          if (kv) {
-            const userReservasKey = `user:${chatId}:reservas`;
-            const userReservas = await kv.get(userReservasKey) || [];
-            let rawArray = Array.isArray(userReservas) ? userReservas : JSON.parse(userReservas as string);
-            
-            const validReservations = [];
-            let changed = false;
-            for (const r of rawArray) {
-              const exists = await kv.get(`reserva:id:${r.id}`);
-              if (exists) {
-                validReservations.push(r);
-              } else {
-                changed = true;
-              }
-            }
-            
-            if (changed) {
-              await kv.set(userReservasKey, JSON.stringify(validReservations));
-            }
-            reservasArray = validReservations;
-          } else {
-            const localReservations = getLocalReservations();
-            reservasArray = localReservations.filter(r => r.chatId === chatId);
-          }
-
-          if (reservasArray.length === 0) {
-            await sendWithKeyboard(
-              'Todavía no tenés reservas. ¿Querés hacer una?',
-              [
-                [{ text: '✅ Sí, reservar', callback_data: 'reservar' }],
-                [BTN.MENU]
-              ]
-            );
-          } else {
-            const { keyboard, futuras, pastCount } = await buildMisReservasKeyboard(reservasArray);
-            if (futuras.length === 0) {
-              await sendWithKeyboard(
-                'No tenés turnos próximos. ¿Querés reservar uno nuevo?',
-                [[BTN.RESERVAR], [BTN.MENU]]
-              );
-            } else {
-              await sendWithKeyboard(
-                `📋 *Tus turnos*\n\nTocá *Cambiar* o *Cancelar* en cada uno.${pastCount > 0 ? `\n_(${pastCount} pasados ocultos)_` : ''}`,
-                keyboard
-              );
-            }
-          }
+          await showMisReservas(chatId, sendWithKeyboard, {
+            mode: getMisReservasMode(text),
+            saveState,
+            userText: text,
+          });
         } else if (aiResult.intent.action === 'reservar') {
           const limitReached = await checkReservationLimit(chatId);
           if (limitReached) {
             await sendWithKeyboard(
-              '⚠️ *Límite de reservas alcanzado*\n\nYa tenés el máximo de turnos activos permitidos. Para reservar uno nuevo, primero tenés que cancelar alguno desde tus reservas.',
+              buildLimitReachedMessage(MAX_RESERVACIONES_POR_USUARIO),
               [[{ text: '📋 Mis reservas', callback_data: 'misreservas' }], [{ text: '🏠 Menú', callback_data: 'menu' }]]
             );
           } else {
-            const profesionales = await getProfesionales();
-            const profile = await getUserProfile(chatId, kv);
-
-            let newEstado: ConversationState = { paso: 'profesional' };
-            
-            if (aiResult.intent.parameters?.profesional) {
-              // Find the professional
-              const prof = profesionales.find(p =>
-                matchesLoosely(p, aiResult.intent.parameters!.profesional!)
-              );
-              if (prof) {
-                newEstado.profesional = prof;
-                newEstado.paso = 'servicio';
-              }
-            }
-            
-            if (aiResult.intent.parameters?.servicio) {
-              const servicios = await getServiciosList();
-              const serv = servicios.find(s =>
-                matchesLoosely(s.nombre, aiResult.intent.parameters!.servicio!)
-              );
-              if (serv) {
-                newEstado.servicio = serv.nombre;
-                if (newEstado.paso === 'servicio') {
-                  newEstado.paso = 'nombre';
-                }
-              }
-            }
-            
-            if (aiResult.intent.parameters?.nombre) {
-              newEstado.nombre = aiResult.intent.parameters.nombre;
-              if (newEstado.paso === 'nombre') {
-                newEstado.paso = 'fecha';
-              }
-            } else if (profile?.nombre && newEstado.paso === 'nombre') {
-              newEstado.nombre = profile.nombre;
-              newEstado.paso = 'fecha';
-            }
-            
-            if (aiResult.intent.parameters?.fecha) {
-              newEstado.fecha = aiResult.intent.parameters.fecha;
-              if (newEstado.paso === 'fecha' && newEstado.profesional && newEstado.servicio) {
-                newEstado.paso = 'hora';
-              }
-            }
-            
-            // Arranque limpio: no heredar profesional/fecha de un flujo anterior
-            await saveState({
-              paso: newEstado.paso,
-              ...(newEstado.profesional ? { profesional: newEstado.profesional } : {}),
-              ...(newEstado.servicio ? { servicio: newEstado.servicio } : {}),
-              ...(newEstado.nombre ? { nombre: newEstado.nombre } : {}),
-              ...(newEstado.fecha ? { fecha: newEstado.fecha } : {}),
-              clear: (
-                ['profesional', 'servicio', 'nombre', 'fecha', 'hora', 'rescheduleId'] as const
-              ).filter(k => newEstado[k] === undefined),
+            await replyWithAvailabilityTool(chatId, {
+              fecha: parseFecha(text) || undefined,
+              saveState,
+              sendWithKeyboard,
             });
-            
-            // Flujo canónico: profesional → servicio
-            if (newEstado.paso === 'profesional' || newEstado.paso === 'servicio') {
-              if (newEstado.profesional && newEstado.paso === 'servicio') {
-                await sendWithKeyboard(
-                  withFlowProgress(
-                    'servicio',
-                    aiResult.responseText?.trim() ||
-                      `*${newEstado.profesional}* ✔️\n\n¿Qué servicio querés reservar?`
-                  ),
-                  await buildServiciosKeyboard(true)
-                );
-              } else if (newEstado.servicio && !newEstado.profesional) {
-                await saveState({
-                  paso: 'profesional',
-                  servicio: newEstado.servicio,
-                  ...(newEstado.nombre ? { nombre: newEstado.nombre } : {}),
-                  ...(newEstado.fecha ? { fecha: newEstado.fecha } : {}),
-                  clear: ['profesional', 'hora', 'rescheduleId'],
-                });
-                await sendWithKeyboard(
-                  withFlowProgress(
-                    'profesional',
-                    `*${newEstado.servicio}* ✔️\n\n¿Con qué profesional te querés atender?`
-                  ),
-                  await buildProfesionalesKeyboard(newEstado.servicio)
-                );
-              } else {
-                await startBookingWithProfessional(
-                  saveState,
-                  sendWithKeyboard,
-                  aiResult.responseText?.trim() ||
-                    '¡Dale! Elegí el profesional y después armamos el turno:',
-                  {
-                    ...(newEstado.fecha ? { fecha: newEstado.fecha } : {}),
-                    ...(newEstado.nombre ? { nombre: newEstado.nombre } : {}),
-                  }
-                );
-              }
-            } else if (newEstado.paso === 'nombre') {
-              const step = await buildNombreStep(newEstado, chatId, `*${newEstado.servicio}* ✔️\n\n`);
-              await saveState(step.estado);
-              await sendWithKeyboard(step.text, step.keyboard);
-            } else if (newEstado.paso === 'fecha') {
-              const view = await buildFechasView(newEstado.servicio, newEstado.profesional);
-              await sendWithKeyboard(`Hola *${newEstado.nombre}* 👋\n\n${view.text}`, view.keyboard);
-            } else if (newEstado.paso === 'hora') {
-              const view = await buildHorariosView(newEstado.fecha!, newEstado.servicio!, newEstado.profesional!);
-              await sendWithKeyboard(view.text, view.keyboard);
-            }
           }
         } else {
           await sendWithKeyboard(aiResult.responseText);
         }
-      } else if (estado?.paso && (aiResult.shouldContinueWithFlow || isValidFlowInput(text, estado.paso))) {
+      } else if (estado?.paso) {
+        // Paso a paso: si el input no cierra el paso, el handler re-pregunta (sin saltar)
         console.log('Continuing with existing flow, estado:', estado);
 
         if (estado.paso === 'profesional') {
@@ -2646,46 +4700,15 @@ export async function POST(request: NextRequest) {
           }
         } else if (estado.paso === 'servicio') {
           const servicios = await getServiciosList();
-          const normalized = normalizeHumanText(text);
-          let servicioSeleccionado: string | null | undefined = null;
-
-          if (['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w => normalized.includes(w))) {
-            servicioSeleccionado = servicios[Math.floor(Math.random() * servicios.length)].nombre;
-          } else {
-            const num = parseInt(text);
-            if (!isNaN(num) && num >= 1 && num <= servicios.length) {
-              servicioSeleccionado = servicios[num - 1].nombre;
-            } else {
-              servicioSeleccionado = servicios.find(s => matchesLoosely(s.nombre, text))?.nombre ?? null;
-            }
-          }
-
+          const servicioSeleccionado = matchServicioFromText(text, servicios);
           if (servicioSeleccionado) {
-            if (!estado.profesional) {
-              await saveState({
-                paso: 'profesional',
-                servicio: servicioSeleccionado,
-                clear: ['profesional', 'fecha', 'hora'],
-              });
-              await sendWithKeyboard(
-                withFlowProgress(
-                  'profesional',
-                  `*${servicioSeleccionado}* ✔️\n\n¿Con qué profesional te querés atender?`
-                ),
-                await buildProfesionalesKeyboard(servicioSeleccionado)
-              );
-            } else {
-              const profile = await getUserProfile(chatId, kv);
-              const nombreGuardado = estado.nombre || profile?.nombre;
-              if (nombreGuardado) {
-                await saveState({ ...estado, paso: 'fecha', servicio: servicioSeleccionado, nombre: nombreGuardado });
-                const view = await buildFechasView(servicioSeleccionado, estado.profesional);
-                await sendWithKeyboard(`Hola *${nombreGuardado}* 👋\n\n${view.text}`, view.keyboard);
-              } else {
-                await saveState({ ...estado, paso: 'nombre', servicio: servicioSeleccionado });
-                await sendWithKeyboard(`*${servicioSeleccionado}* ✔️\n\n¿Cuál es tu nombre?`, FLOW_CANCEL_KEYBOARD);
-              }
-            }
+            await applyServicioSelection(
+              chatId,
+              estado,
+              servicioSeleccionado,
+              saveState,
+              sendWithKeyboard
+            );
           } else {
             await sendWithKeyboard(
               'No reconozco ese servicio. Por favor elegí uno:',
@@ -2694,21 +4717,7 @@ export async function POST(request: NextRequest) {
           }
 
         } else if (estado.paso === 'nombre') {
-          if (!isValidPersonName(text)) {
-            await sendWithKeyboard(
-              withFlowProgress(
-                'nombre',
-                'Necesito tu nombre real para la reserva (sin números ni frases). Por ejemplo: *María López*.'
-              ),
-              FLOW_CANCEL_KEYBOARD
-            );
-          } else {
-            const nombre = capitalizeName(text);
-            await saveState({ ...estado, paso: 'fecha', nombre });
-            await saveUserProfile(chatId, nombre, kv);
-            const view = await buildFechasView(estado.servicio, estado.profesional);
-            await sendWithKeyboard(`Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
-          }
+          await handleFlowNombreInput(chatId, estado, text, { saveState, sendWithKeyboard });
 
         } else if (estado.paso === 'fecha') {
           const fechaParseada = parseFecha(text);
@@ -2719,7 +4728,7 @@ export async function POST(request: NextRequest) {
           if (fechaParseada && esDiaValido) {
             await showHorarios(fechaParseada, estado.servicio!, estado.profesional!);
           } else if (fechaParseada && !esDiaValido) {
-            const keyboard = await buildFechasKeyboard(estado.profesional);
+            const keyboard = await buildFechasKeyboard(estado.profesional, estado.servicio, estado.rescheduleId);
             await sendWithKeyboard(
               '❌ El profesional no atiende ese día. Elegí otro:',
               keyboard
@@ -2730,6 +4739,26 @@ export async function POST(request: NextRequest) {
           }
 
         } else if (estado.paso === 'hora') {
+          // "mañana 19" / "el lunes" = cambiar FECHA, no filtrar franja "mañana"
+          const fechaNueva = parseFecha(text);
+          if (fechaNueva && fechaNueva !== estado.fecha) {
+            const laborable = await esDiaLaborable(fechaNueva, estado.profesional);
+            if (!laborable) {
+              const keyboard = await buildFechasKeyboard(
+                estado.profesional,
+                estado.servicio,
+                estado.rescheduleId
+              );
+              await sendWithKeyboard(
+                `Ese día (*${formatDateAR(fechaNueva)}*) no hay agenda con *${estado.profesional}*. Elegí otra fecha:`,
+                keyboard
+              );
+              return NextResponse.json({ status: 'ok' });
+            }
+            await showHorarios(fechaNueva, estado.servicio!, estado.profesional!);
+            return NextResponse.json({ status: 'ok' });
+          }
+
           const horariosLibres = await obtenerHorariosLibres(
             estado.fecha!,
             estado.profesional!,
@@ -2738,10 +4767,16 @@ export async function POST(request: NextRequest) {
           );
           let horaSeleccionada: string | null = null;
 
-          // Manejo de preferencia de turno: "mañana" o "tarde"
+          // Franja solo con "por la mañana / a la tarde" (no "mañana" = día)
           const normalizedPeriod = normalizeHumanText(text);
-          const wantsMorning = ['manana', 'mañana', 'morning', 'por la manana', 'por la mañana', 'la manana', 'la mañana'].some(w => normalizedPeriod.includes(w));
-          const wantsAfternoon = ['tarde', 'afternoon', 'por la tarde', 'la tarde'].some(w => normalizedPeriod.includes(w));
+          const morningPref =
+            /por\s+la\s+manana|a\s+la\s+manana|de\s+manana|x\s+la\s+manana/.test(normalizedPeriod);
+          const afternoonPref =
+            /por\s+la\s+tarde|a\s+la\s+tarde|de\s+tarde|x\s+la\s+tarde/.test(normalizedPeriod);
+          const wantsMorning = morningPref;
+          const wantsAfternoon =
+            afternoonPref ||
+            (/\btarde\b/.test(normalizedPeriod) && !parseFecha(text) && !morningPref);
           const mentionsConcreteTime = extractHoraCandidates(text).length > 0;
 
           if ((wantsMorning || wantsAfternoon) && !mentionsConcreteTime) {
@@ -2806,9 +4841,13 @@ export async function POST(request: NextRequest) {
             );
 
             if (disponibilidad.disponible) {
-              await saveState({ ...estado, paso: 'confirmar', hora: horaSeleccionada });
-              const view = await buildConfirmacionView({ ...estado, hora: horaSeleccionada });
-              await sendWithKeyboard(view.text, view.keyboard);
+              await proceedAfterSlotChosen(
+                chatId,
+                estado,
+                horaSeleccionada,
+                saveState,
+                sendWithKeyboard
+              );
             } else {
               const viewActualizada = await buildHorariosView(
                 estado.fecha!,
@@ -2840,6 +4879,17 @@ export async function POST(request: NextRequest) {
           const cancelWords = ['no', 'cancelar', 'cancel', 'nop', 'nope'];
 
           if (confirmWords.includes(normalizedConfirm)) {
+            const nombreOk = await resolvePatientNombre(chatId, estado);
+            if (!nombreOk) {
+              await proceedAfterSlotChosen(
+                chatId,
+                estado,
+                estado.hora!,
+                saveState,
+                sendWithKeyboard
+              );
+              return NextResponse.json({ status: 'ok' });
+            }
             // Tratar como confirmar_reserva / confirmar_reprogramar por texto
             const disponibilidad = await verificarDisponibilidad(
               estado.profesional!, estado.servicio!, estado.fecha!, estado.hora!
@@ -2859,7 +4909,7 @@ export async function POST(request: NextRequest) {
                 const reserva = await guardarReserva(chatId, {
                   profesional: estado.profesional!,
                   servicio: estado.servicio!,
-                  nombre: estado.nombre!,
+                  nombre: nombreOk,
                   fecha: estado.fecha!,
                   hora: estado.hora!,
                   chatId
@@ -2894,26 +4944,38 @@ export async function POST(request: NextRequest) {
           // Hay un flujo activo: no limpiar el estado, mostrar botones contextuales
           const contextKeyboard = await getContextualKeyboard(estado);
           await sendWithKeyboard(aiResult.responseText, contextKeyboard);
-        } else if (containsBookingIntent(text) || /turno|cita|reserv/i.test(aiResult.responseText)) {
-          // Pedido de turno mal clasificado → arrancar con profesional
-          await startBookingWithProfessional(
+        } else if (looksLikeAvailabilityQuestion(text) || parseFecha(text)) {
+          // Solo menú de cupos con señal clara; si no, respetá la prosa del modelo
+          await replyWithAvailabilityTool(chatId, {
+            fecha: parseFecha(text) || undefined,
             saveState,
             sendWithKeyboard,
-            '¡Dale! Elegí el profesional y después armamos el turno:'
-          );
+          });
         } else {
           await clearState();
           await sendWithKeyboard(aiResult.responseText, ASSIST_KEYBOARD);
         }
       } else if (estado?.paso) {
-        // No cortar el flujo: el usuario se equivocó, lo guiamos de nuevo
         const contextKeyboard = await getContextualKeyboard(estado);
         await sendWithKeyboard(
-          'No te entendí del todo 🙏 Seguimos con la reserva. Elegí una opción o respondé lo que te pedí:',
+          'No te entendí del todo. ¿Me lo aclarás? También podés usar los botones.',
           contextKeyboard
         );
       } else {
-        await showMainMenu();
+        // Nunca resetear al menú de bienvenida por un mensaje no reconocido
+        const fechaOrphan = parseFecha(text);
+        if (fechaOrphan) {
+          await replyWithAvailabilityTool(chatId, {
+            fecha: fechaOrphan,
+            saveState,
+            sendWithKeyboard,
+          });
+        } else {
+          await sendWithKeyboard(
+            'No te entendí del todo. ¿Querés un turno, ver servicios o consultar algo de la clínica?',
+            ASSIST_KEYBOARD
+          );
+        }
       }
     }
 

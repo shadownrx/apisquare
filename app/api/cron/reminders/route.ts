@@ -3,7 +3,10 @@ import { processReminders } from '@/lib/reminders';
 
 function isAuthorized(request: NextRequest): boolean {
   const cronSecret = process.env.CRON_SECRET?.trim();
-  if (!cronSecret) return true; // sin secret configurado (solo para setup inicial)
+  if (!cronSecret) {
+    console.error('[cron/reminders] CRON_SECRET is not configured');
+    return false;
+  }
 
   const authHeader = request.headers.get('authorization');
   if (authHeader === `Bearer ${cronSecret}`) return true;
