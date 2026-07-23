@@ -15,7 +15,7 @@ import {
   replaceGeminiHistoryFromChat,
 } from './gemini-history';
 import { MAX_TOOL_ROUNDS, buildSystemPrompt, executeNamedTool, mergeToolUi } from './shared';
-import type { AssistantSideEffect, AssistantTurnInput, AssistantTurnResult } from './types';
+import type { AssistantKeyboard, AssistantSideEffect, AssistantTurnInput, AssistantTurnResult } from './types';
 
 function toGeminiFunctionDeclarations(): FunctionDeclaration[] {
   return ASSISTANT_TOOL_DEFINITIONS.map(t => {
@@ -64,7 +64,7 @@ function extractTextFromParts(parts: Part[] | undefined): string {
 }
 
 type GeminiUiState = {
-  keyboard: AssistantTurnResult['keyboard'];
+  keyboard: AssistantKeyboard | null;
   sideEffect: AssistantSideEffect | null;
   lockedByHold: boolean;
   usedTools: string[];
@@ -117,7 +117,7 @@ async function runGeminiChatTurn(
           : {};
       const toolResult = await executeNamedTool(call.name, args, input.handlers);
       const merged = mergeToolUi(call.name, toolResult, {
-        keyboard: ui.keyboard,
+        keyboard: ui.keyboard ?? null,
         sideEffect: ui.sideEffect,
         lockedByHold: ui.lockedByHold,
       });
