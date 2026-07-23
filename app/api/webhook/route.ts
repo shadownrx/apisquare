@@ -5,6 +5,7 @@ import { getLocalReservations, addLocalReservation } from '../admin/reservations
 import {
   buildAppointmentsToolResult,
   clearGeminiHistory,
+  consumeGeminiRateLimit,
   runAssistantTurn,
   type AppointmentsAction,
   type AssistantToolHandlers,
@@ -2986,6 +2987,17 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
             pedirAnticipacion: true,
           };
           break;
+        case 'profesionales': {
+          const nombres = await getProfesionales();
+          facts = {
+            topic,
+            profesionales: nombres,
+            atencion: 'particular',
+            note: 'Listá los nombres al paciente en prosa. No inventes otros.',
+          };
+          keyboard = await buildProfesionalesKeyboard();
+          break;
+        }
         default:
           facts = { topic, resumen: await buildClinicContextForAI() };
           break;
@@ -4245,7 +4257,7 @@ export async function POST(request: NextRequest) {
         await sendWithKeyboard(view.text, view.keyboard);
       };
 
-      // Gemini puro: el texto siempre lo escribe el modelo. Botones = atajos (callbacks).
+      // Botones = callbacks. Texto: reglas mid-flow primero; Gemini NLU después; reglas otra vez si falla.
       const quickLocal = parseLocalIntent(text);
 
       // Menú / reset explícito → limpia draft + historial Gemini
@@ -4272,57 +4284,232 @@ export async function POST(request: NextRequest) {
         draftForAgent = {};
       }
 
-      // Texto libre → Gemini (prosa + tools). Callbacks de botones siguen en el branch de callback_query.
-      // Fallbacks locales (servicio/profesional/confirm/fecha/hora) solo si viaLlm=false más abajo.
+      // ── REGLAS PRIMERO (mid-flow estructurado): no depender de Gemini ──
+      if (
+        estado?.paso === 'servicio' &&
+        !looksLikeQuestion(text) &&
+        !parseFecha(text) &&
+        !looksLikeHoraInput(text)
+      ) {
+        const servicios = await getServiciosList();
+        const servicioSeleccionado = matchServicioFromText(text, servicios);
+        if (servicioSeleccionado) {
+          await applyServicioSelection(
+            chatId,
+            estado,
+            servicioSeleccionado,
+            saveState,
+            sendWithKeyboard
+          );
+          return NextResponse.json({ status: 'ok' });
+        }
+      }
 
-      const flowCtx = { saveState, sendWithKeyboard };
-
-      // Gemini primero: interpreta prosa. Plantillas locales solo si el LLM falla.
-      {
-        const profile = await getUserProfile(chatId, kv);
-        const history = await getChatHistory(chatId, kv);
-
-        const assistantResult = await runAssistantTurn({
-          userMessage: text,
-          chatId,
-          historyText: formatChatHistoryForPrompt(history),
-          clinicContext: await buildClinicContextForAI(),
-          draft: draftForAgent,
-          profileSummary: profile
-            ? `nombre=${profile.nombre || '-'}, ultimoTurno=${profile.lastProfesional || '-'}/${profile.lastServicio || '-'} (solo si pide repetir)`
-            : undefined,
-          handlers: makeAssistantHandlers(chatId),
-        });
-
+      if (estado?.paso === 'profesional' && !looksLikeQuestion(text) && !parseFecha(text)) {
+        const profesionales = await getProfesionales();
+        const normalized = normalizeHumanText(text);
+        let profSeleccionado: string | null = null;
         if (
-          await dispatchAssistantTurnResult(chatId, assistantResult, {
+          ['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w =>
+            normalized.includes(w)
+          )
+        ) {
+          profSeleccionado =
+            profesionales[Math.floor(Math.random() * profesionales.length)] || null;
+        } else {
+          const num = parseInt(text, 10);
+          if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
+            profSeleccionado = profesionales[num - 1];
+          } else {
+            profSeleccionado = profesionales.find(p => matchesLoosely(p, text)) || null;
+          }
+        }
+        if (profSeleccionado) {
+          await continueAfterProfessional(
+            chatId,
+            estado,
+            profSeleccionado,
             saveState,
             sendWithKeyboard,
-            clearState,
-            draft: draftForAgent,
-          })
-        ) {
-          // Si Gemini habló del nombre pero no llamó la tool, forzar persistencia
-          const needsName =
-            (draftForAgent?.paso === 'nombre' ||
-              (draftForAgent?.hora &&
-                draftForAgent?.fecha &&
-                draftForAgent?.profesional &&
-                draftForAgent?.servicio &&
-                !sanitizePersonName(draftForAgent?.nombre))) &&
-            extractPersonName(text) &&
-            !assistantResult.usedTools.includes('set_patient_name');
-          if (needsName) {
-            await handleFlowNombreInput(chatId, { ...draftForAgent, paso: 'nombre' }, text, {
+            `*${profSeleccionado}* ✔️\n\n`
+          );
+          return NextResponse.json({ status: 'ok' });
+        }
+      }
+
+      if (estado?.paso === 'confirmar' && estado.hora && estado.fecha) {
+        const normalizedConfirm = normalizeHumanText(text);
+        const confirmWords = [
+          'si',
+          'sí',
+          'dale',
+          'confirmar',
+          'confirmo',
+          'ok',
+          'listo',
+          'yes',
+          'bueno',
+          'va',
+        ];
+        const cancelWords = ['no', 'cancelar', 'cancel', 'nop', 'nope'];
+        if (confirmWords.includes(normalizedConfirm)) {
+          const nombreOk = await resolvePatientNombre(chatId, estado);
+          if (!nombreOk) {
+            await proceedAfterSlotChosen(
+              chatId,
+              estado,
+              estado.hora!,
               saveState,
-              sendWithKeyboard,
-            });
+              sendWithKeyboard
+            );
+            return NextResponse.json({ status: 'ok' });
+          }
+          const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
+          const disponibilidad = await verificarDisponibilidad(
+            estado.profesional!,
+            estado.servicio!,
+            estado.fecha!,
+            estado.hora!,
+            rescheduleOptions
+          );
+          if (disponibilidad.disponible) {
+            if (estado.rescheduleId) {
+              const reserva = await reprogramarReserva(
+                chatId,
+                estado.rescheduleId,
+                estado.fecha!,
+                estado.hora!
+              );
+              if (reserva) {
+                await clearState();
+                const serv = await getServicio(reserva.servicio);
+                await sendWithKeyboard(
+                  buildSuccessMessage(reserva, serv, true),
+                  POST_BOOKING_KEYBOARD
+                );
+              }
+            } else {
+              const reserva = await guardarReserva(chatId, {
+                profesional: estado.profesional!,
+                servicio: estado.servicio!,
+                nombre: nombreOk,
+                fecha: estado.fecha!,
+                hora: estado.hora!,
+                chatId,
+              });
+              if (reserva) {
+                await clearState();
+                const serv = await getServicio(reserva.servicio);
+                await sendWithKeyboard(
+                  buildSuccessMessage(reserva, serv, false),
+                  POST_BOOKING_KEYBOARD
+                );
+              } else {
+                const viewActualizada = await buildHorariosView(
+                  estado.fecha!,
+                  estado.servicio!,
+                  estado.profesional!
+                );
+                await sendWithKeyboard(
+                  `⚠️ Ese horario acaba de ser reservado.\n\nElegí otro turno:`,
+                  viewActualizada.keyboard
+                );
+              }
+            }
+          } else {
+            const viewActualizada = await buildHorariosView(
+              estado.fecha!,
+              estado.servicio!,
+              estado.profesional!,
+              estado.rescheduleId
+            );
+            await sendWithKeyboard(
+              `⚠️ ${disponibilidad.mensaje || 'Ese horario ya no está disponible.'}\n\nElegí otro turno:`,
+              viewActualizada.keyboard
+            );
           }
           return NextResponse.json({ status: 'ok' });
         }
+        if (cancelWords.includes(normalizedConfirm)) {
+          await clearState();
+          await sendWithKeyboard('Cancelado. ¿En qué más puedo ayudarte?', ASSIST_KEYBOARD);
+          return NextResponse.json({ status: 'ok' });
+        }
+      }
 
-        // Fallback solo si Gemini falló: no inventar prosa de plantilla
-        // Mis reservas gana aunque haya draft a medias (no empujar "¿para qué día?")
+      const flowCtx = { saveState, sendWithKeyboard };
+      const logGeminiFallback = (reason: string) => {
+        console.warn('[gemini-fallback]', {
+          chatId,
+          reason,
+          preview: text.slice(0, 80),
+          paso: estado?.paso || null,
+        });
+      };
+
+      // ── Gemini NLU (rate-limited); si falla → motor de reglas intacto ──
+      {
+        const rate = await consumeGeminiRateLimit(chatId);
+        let geminiHandled = false;
+
+        if (!rate.allowed) {
+          logGeminiFallback('rate_limit');
+        } else {
+          try {
+            const profile = await getUserProfile(chatId, kv);
+            const history = await getChatHistory(chatId, kv);
+
+            const assistantResult = await runAssistantTurn({
+              userMessage: text,
+              chatId,
+              historyText: formatChatHistoryForPrompt(history),
+              clinicContext: await buildClinicContextForAI(),
+              draft: draftForAgent,
+              profileSummary: profile
+                ? `nombre=${profile.nombre || '-'}, ultimoTurno=${profile.lastProfesional || '-'}/${profile.lastServicio || '-'} (solo si pide repetir)`
+                : undefined,
+              handlers: makeAssistantHandlers(chatId),
+            });
+
+            if (
+              await dispatchAssistantTurnResult(chatId, assistantResult, {
+                saveState,
+                sendWithKeyboard,
+                clearState,
+                draft: draftForAgent,
+              })
+            ) {
+              const needsName =
+                (draftForAgent?.paso === 'nombre' ||
+                  (draftForAgent?.hora &&
+                    draftForAgent?.fecha &&
+                    draftForAgent?.profesional &&
+                    draftForAgent?.servicio &&
+                    !sanitizePersonName(draftForAgent?.nombre))) &&
+                extractPersonName(text) &&
+                !assistantResult.usedTools.includes('set_patient_name');
+              if (needsName) {
+                await handleFlowNombreInput(chatId, { ...draftForAgent, paso: 'nombre' }, text, {
+                  saveState,
+                  sendWithKeyboard,
+                });
+              }
+              geminiHandled = true;
+            } else {
+              logGeminiFallback(assistantResult.viaLlm ? 'empty_payload' : 'viaLlm_false');
+            }
+          } catch (geminiErr) {
+            logGeminiFallback(
+              `exception:${geminiErr instanceof Error ? geminiErr.message : 'unknown'}`
+            );
+          }
+        }
+
+        if (geminiHandled) {
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        // Fallback reglas: no inventar prosa de plantilla
         if (isMisReservasIntent(text) || quickLocal?.action === 'misreservas') {
           await showMisReservas(chatId, sendWithKeyboard, {
             mode: getMisReservasMode(text),
@@ -4332,15 +4519,32 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ status: 'ok' });
         }
 
-        // FAQ / horario de atención: no empujar menú de servicios
         if (isClinicScheduleQuestion(text) || parseInfoQuery(text) === 'horarios') {
           await showInfoResponse('horarios');
           return NextResponse.json({ status: 'ok' });
         }
 
-        // Solo cupos si pide turno NUEVO de forma clara (nunca por draft residual)
+        // Profesionales / médicos (también mid-flow) — antes del "no pude procesar"
+        if (quickLocal?.action === 'profesionales') {
+          const profesionales = await getProfesionales();
+          const list = profesionales.map(p => `• *${p}*`).join('\n');
+          const contextKeyboard = estado?.paso
+            ? await getContextualKeyboard(estado)
+            : ASSIST_KEYBOARD;
+          await sendWithKeyboard(
+            `Atienden *${profesionales.join('* y *')}*.\n\n${list}\n\n*(Atención particular, sin obra social)*` +
+              (estado?.paso ? '\n\nCuando quieras seguimos con tu reserva 👇' : ''),
+            contextKeyboard?.length ? contextKeyboard : ASSIST_KEYBOARD
+          );
+          return NextResponse.json({ status: 'ok' });
+        }
+
+        if (quickLocal?.action === 'servicios') {
+          await showServiciosCatalog();
+          return NextResponse.json({ status: 'ok' });
+        }
+
         const fechaHint = parseFecha(text);
-        // Cupos solo con señal clara de RESERVAR. "mañana" en una FAQ de horarios NO cuenta.
         const infoQ = parseInfoQuery(text);
         const wantsCupos =
           !hasHeldBookingSlot(estado) &&
@@ -4361,7 +4565,6 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ status: 'ok' });
         }
 
-        // Gemini falló mid-flow: saludo sin reset
         if (estado?.paso && isGreetingOrChatReset(text)) {
           const contextKeyboard = await getContextualKeyboard(estado);
           const resumeHint = estado.fecha
@@ -4371,8 +4574,7 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ status: 'ok' });
         }
 
-        // Gemini falló mid-flow: FAQ estática antes de pedir repetir
-        if (estado?.paso && looksLikeQuestion(text)) {
+        if (estado?.paso) {
           const consultaInfo = parseInfoQuery(text);
           if (consultaInfo) {
             await showInfoResponse(consultaInfo);
@@ -4380,7 +4582,6 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        // Gemini falló: pasos locales (fecha/hora/nombre/servicio/profesional/confirm) como red de seguridad
         if (estado?.paso === 'fecha' && isValidFlowInput(text, 'fecha')) {
           if (await handleFlowFechaInput(chatId, estado, text, flowCtx)) {
             return NextResponse.json({ status: 'ok' });
@@ -4420,159 +4621,7 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        if (
-          estado?.paso === 'servicio' &&
-          !looksLikeQuestion(text) &&
-          !parseFecha(text) &&
-          !looksLikeHoraInput(text)
-        ) {
-          const servicios = await getServiciosList();
-          const servicioSeleccionado = matchServicioFromText(text, servicios);
-          if (servicioSeleccionado) {
-            await applyServicioSelection(
-              chatId,
-              estado,
-              servicioSeleccionado,
-              saveState,
-              sendWithKeyboard
-            );
-            return NextResponse.json({ status: 'ok' });
-          }
-        }
-
-        if (estado?.paso === 'profesional' && !looksLikeQuestion(text) && !parseFecha(text)) {
-          const profesionales = await getProfesionales();
-          const normalized = normalizeHumanText(text);
-          let profSeleccionado: string | null = null;
-          if (
-            ['al azar', 'aleatorio', 'cualquiera', 'da igual', 'me da igual'].some(w =>
-              normalized.includes(w)
-            )
-          ) {
-            profSeleccionado =
-              profesionales[Math.floor(Math.random() * profesionales.length)] || null;
-          } else {
-            const num = parseInt(text, 10);
-            if (!isNaN(num) && num >= 1 && num <= profesionales.length) {
-              profSeleccionado = profesionales[num - 1];
-            } else {
-              profSeleccionado = profesionales.find(p => matchesLoosely(p, text)) || null;
-            }
-          }
-          if (profSeleccionado) {
-            await continueAfterProfessional(
-              chatId,
-              estado,
-              profSeleccionado,
-              saveState,
-              sendWithKeyboard,
-              `*${profSeleccionado}* ✔️\n\n`
-            );
-            return NextResponse.json({ status: 'ok' });
-          }
-        }
-
-        if (estado?.paso === 'confirmar' && estado.hora && estado.fecha) {
-          const normalizedConfirm = normalizeHumanText(text);
-          const confirmWords = [
-            'si',
-            'sí',
-            'dale',
-            'confirmar',
-            'confirmo',
-            'ok',
-            'listo',
-            'yes',
-            'bueno',
-            'va',
-          ];
-          const cancelWords = ['no', 'cancelar', 'cancel', 'nop', 'nope'];
-          if (confirmWords.includes(normalizedConfirm)) {
-            const nombreOk = await resolvePatientNombre(chatId, estado);
-            if (!nombreOk) {
-              await proceedAfterSlotChosen(
-                chatId,
-                estado,
-                estado.hora!,
-                saveState,
-                sendWithKeyboard
-              );
-              return NextResponse.json({ status: 'ok' });
-            }
-            const rescheduleOptions = await getRescheduleOptions(chatId, estado.rescheduleId);
-            const disponibilidad = await verificarDisponibilidad(
-              estado.profesional!,
-              estado.servicio!,
-              estado.fecha!,
-              estado.hora!,
-              rescheduleOptions
-            );
-            if (disponibilidad.disponible) {
-              if (estado.rescheduleId) {
-                const reserva = await reprogramarReserva(
-                  chatId,
-                  estado.rescheduleId,
-                  estado.fecha!,
-                  estado.hora!
-                );
-                if (reserva) {
-                  await clearState();
-                  const serv = await getServicio(reserva.servicio);
-                  await sendWithKeyboard(
-                    buildSuccessMessage(reserva, serv, true),
-                    POST_BOOKING_KEYBOARD
-                  );
-                }
-              } else {
-                const reserva = await guardarReserva(chatId, {
-                  profesional: estado.profesional!,
-                  servicio: estado.servicio!,
-                  nombre: nombreOk,
-                  fecha: estado.fecha!,
-                  hora: estado.hora!,
-                  chatId,
-                });
-                if (reserva) {
-                  await clearState();
-                  const serv = await getServicio(reserva.servicio);
-                  await sendWithKeyboard(
-                    buildSuccessMessage(reserva, serv, false),
-                    POST_BOOKING_KEYBOARD
-                  );
-                } else {
-                  const viewActualizada = await buildHorariosView(
-                    estado.fecha!,
-                    estado.servicio!,
-                    estado.profesional!
-                  );
-                  await sendWithKeyboard(
-                    `⚠️ Ese horario acaba de ser reservado.\n\nElegí otro turno:`,
-                    viewActualizada.keyboard
-                  );
-                }
-              }
-            } else {
-              const viewActualizada = await buildHorariosView(
-                estado.fecha!,
-                estado.servicio!,
-                estado.profesional!,
-                estado.rescheduleId
-              );
-              await sendWithKeyboard(
-                `⚠️ ${disponibilidad.mensaje || 'Ese horario ya no está disponible.'}\n\nElegí otro turno:`,
-                viewActualizada.keyboard
-              );
-            }
-            return NextResponse.json({ status: 'ok' });
-          }
-          if (cancelWords.includes(normalizedConfirm)) {
-            await clearState();
-            await sendWithKeyboard('Cancelado. ¿En qué más puedo ayudarte?', ASSIST_KEYBOARD);
-            return NextResponse.json({ status: 'ok' });
-          }
-        }
-
-        // Gemini falló mid-flow sin ser fecha/cupo: no tirar al menú de bienvenida
+        // Mid-flow sin match: ayuda + botones (último recurso)
         if (estado?.paso) {
           const contextKeyboard = await getContextualKeyboard(estado);
           await sendWithKeyboard(

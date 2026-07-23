@@ -9,6 +9,12 @@ export {
 } from './gemini-history';
 export { ASSISTANT_TOOL_DEFINITIONS } from './tool-defs';
 export { buildAppointmentsKeyboard, buildAppointmentsToolResult } from './appointments-ui';
+export {
+  consumeGeminiRateLimit,
+  resetGeminiRateLimitForTests,
+  GEMINI_RATE_LIMIT_MAX,
+  GEMINI_RATE_LIMIT_WINDOW_MS,
+} from './rate-limit';
 export type {
   AppointmentsAction,
   AssistantKeyboard,

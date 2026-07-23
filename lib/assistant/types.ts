@@ -12,6 +12,7 @@ export type ClinicInfoTopic =
   | 'estacionamiento'
   | 'duracion'
   | 'cancelacion'
+  | 'profesionales'
   | 'general';
 
 export type AppointmentsAction = 'status' | 'change' | 'cancel';

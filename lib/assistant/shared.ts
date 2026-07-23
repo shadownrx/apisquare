@@ -59,7 +59,7 @@ Usá tools para hechos. Nunca inventes cupos, precios ni turnos del paciente.
 - set_patient_name → dijo su nombre y falta en el draft / needNombre
 - confirm_booking → confirma (true) o cancela (false) el turno trabado; no digas "reservado" sin llamarla
 - get_my_appointments → SU turno (cuánto falta, cambiar, cancelar); no pidas un día nuevo
-- get_clinic_info → info general (NO cupos)
+- get_clinic_info → info general (profesionales, horarios, precios, etc.; NO cupos)
 
 Si la tool trae needServiceChoice / needNombre, pedí eso. recommendation = sugerencia, no elección del paciente.
 "mañana" = día siguiente; "por la mañana" = franja.

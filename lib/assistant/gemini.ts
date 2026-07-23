@@ -10,6 +10,7 @@ import {
 import { ASSISTANT_TOOL_DEFINITIONS } from './tool-defs';
 import {
   appendGeminiUserTurn,
+  clearGeminiHistory,
   getGeminiHistory,
   replaceGeminiHistoryFromChat,
 } from './gemini-history';
@@ -62,11 +63,121 @@ function extractTextFromParts(parts: Part[] | undefined): string {
     .trim();
 }
 
+type GeminiUiState = {
+  keyboard: AssistantTurnResult['keyboard'];
+  sideEffect: AssistantSideEffect | null;
+  lockedByHold: boolean;
+  usedTools: string[];
+};
+
+async function runGeminiChatTurn(
+  input: AssistantTurnInput,
+  historyForChat: Content[],
+  userText: string,
+  systemInstruction: string,
+  modelName: string,
+  apiKey: string
+): Promise<AssistantTurnResult> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    systemInstruction,
+    tools: [{ functionDeclarations: toGeminiFunctionDeclarations() }],
+    toolConfig: {
+      functionCallingConfig: { mode: FunctionCallingMode.AUTO },
+    },
+    generationConfig: {
+      temperature: 0.75,
+    },
+  });
+
+  const chat = model.startChat({
+    history: historyForChat,
+  });
+
+  const ui: GeminiUiState = {
+    keyboard: null,
+    sideEffect: null,
+    lockedByHold: false,
+    usedTools: [],
+  };
+
+  let result = await chat.sendMessage(userText);
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const functionCalls = result.response.functionCalls();
+    if (!functionCalls?.length) break;
+
+    const responseParts: Part[] = [];
+    for (const call of functionCalls) {
+      ui.usedTools.push(call.name);
+      const args =
+        call.args && typeof call.args === 'object'
+          ? (call.args as Record<string, unknown>)
+          : {};
+      const toolResult = await executeNamedTool(call.name, args, input.handlers);
+      const merged = mergeToolUi(call.name, toolResult, {
+        keyboard: ui.keyboard,
+        sideEffect: ui.sideEffect,
+        lockedByHold: ui.lockedByHold,
+      });
+      ui.keyboard = merged.keyboard;
+      ui.sideEffect = merged.sideEffect;
+      ui.lockedByHold = merged.lockedByHold;
+      responseParts.push({
+        functionResponse: {
+          name: call.name,
+          response:
+            typeof toolResult.data === 'object' && toolResult.data !== null
+              ? (toolResult.data as object)
+              : { result: toolResult.data },
+        },
+      });
+    }
+
+    result = await chat.sendMessage(responseParts);
+  }
+
+  let text = '';
+  try {
+    text = result.response.text().trim();
+  } catch {
+    text = extractTextFromParts(result.response.candidates?.[0]?.content?.parts);
+  }
+
+  // Si no escribió prosa, forzar una respuesta al paciente (con o sin tools)
+  if (!text) {
+    try {
+      result = await chat.sendMessage(
+        'Respondé ahora al paciente en español rioplatense con lo que ya sabés (contexto y tools). Sin llamar más tools. No uses la palabra undefined.'
+      );
+      try {
+        text = result.response.text().trim();
+      } catch {
+        text = extractTextFromParts(result.response.candidates?.[0]?.content?.parts);
+      }
+    } catch (followUpErr) {
+      console.warn('[assistant/gemini] follow-up vacío falló:', followUpErr);
+    }
+  }
+
+  const updated = await chat.getHistory();
+  await replaceGeminiHistoryFromChat(String(input.chatId), updated);
+
+  return {
+    text,
+    keyboard: ui.keyboard,
+    sideEffect: ui.sideEffect,
+    usedTools: ui.usedTools,
+    viaLlm: true,
+  };
+}
+
 /**
  * Agente Gemini con SDK oficial (@google/generative-ai):
  * - systemInstruction separado
  * - startChat() + historial por sessionId (chatId)
- * - user se persiste ANTES del call; model (vía getHistory) DESPUÉS
+ * - si el historial está corrupto → limpia y reintenta 1 vez
  */
 export async function runGeminiAssistantTurn(
   input: AssistantTurnInput
@@ -85,117 +196,39 @@ export async function runGeminiAssistantTurn(
 
   const systemInstruction = buildSystemPrompt(input);
 
-  // 1) Persistir turno user ANTES de llamar a la API
-  await appendGeminiUserTurn(sessionId, userText);
-
-  // 2) Historial previo (sin el último user: startChat + sendMessage lo reenvía)
-  const fullHistory = await getGeminiHistory(sessionId);
-  const historyForChat: Content[] = fullHistory.slice(0, -1);
-
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    systemInstruction,
-    tools: [{ functionDeclarations: toGeminiFunctionDeclarations() }],
-    toolConfig: {
-      functionCallingConfig: { mode: FunctionCallingMode.AUTO },
-    },
-    generationConfig: {
-      temperature: 0.75,
-    },
-  });
-
-  const chat = model.startChat({
-    history: historyForChat,
-  });
-
-  let keyboard: AssistantTurnResult['keyboard'] = null;
-  let sideEffect: AssistantSideEffect | null = null;
-  let lockedByHold = false;
-  const usedTools: string[] = [];
+  const attempt = async (): Promise<AssistantTurnResult> => {
+    await appendGeminiUserTurn(sessionId, userText);
+    // startChat no debe incluir el user actual (sendMessage lo agrega)
+    const full = await getGeminiHistory(sessionId);
+    const historyForChat = full.slice(0, -1);
+    return runGeminiChatTurn(
+      input,
+      historyForChat,
+      userText,
+      systemInstruction,
+      modelName,
+      apiKey
+    );
+  };
 
   try {
-    let result = await chat.sendMessage(userText);
-
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const functionCalls = result.response.functionCalls();
-      if (!functionCalls?.length) break;
-
-      const responseParts: Part[] = [];
-      for (const call of functionCalls) {
-        usedTools.push(call.name);
-        const args =
-          call.args && typeof call.args === 'object'
-            ? (call.args as Record<string, unknown>)
-            : {};
-        const toolResult = await executeNamedTool(call.name, args, input.handlers);
-        const merged = mergeToolUi(call.name, toolResult, {
-          keyboard,
-          sideEffect,
-          lockedByHold,
-        });
-        keyboard = merged.keyboard;
-        sideEffect = merged.sideEffect;
-        lockedByHold = merged.lockedByHold;
-        responseParts.push({
-          functionResponse: {
-            name: call.name,
-            response:
-              typeof toolResult.data === 'object' && toolResult.data !== null
-                ? (toolResult.data as object)
-                : { result: toolResult.data },
-          },
-        });
-      }
-
-      result = await chat.sendMessage(responseParts);
-    }
-
-    let text = '';
-    try {
-      text = result.response.text().trim();
-    } catch {
-      text = extractTextFromParts(result.response.candidates?.[0]?.content?.parts);
-    }
-
-    // Si usó tools pero no escribió prosa, forzar una respuesta al paciente
-    if (!text && usedTools.length > 0) {
-      try {
-        result = await chat.sendMessage(
-          'Respondé ahora al paciente en español rioplatense, con lo que ya tenés de las tools. Sin llamar más tools. No uses la palabra undefined.'
-        );
-        try {
-          text = result.response.text().trim();
-        } catch {
-          text = extractTextFromParts(result.response.candidates?.[0]?.content?.parts);
-        }
-      } catch (followUpErr) {
-        console.warn('[assistant/gemini] follow-up vacío falló:', followUpErr);
-      }
-    }
-
-    // 3) Persistir historial completo que mantiene el chat (user + model [+ tools])
-    const updated = await chat.getHistory();
-    await replaceGeminiHistoryFromChat(sessionId, updated);
-
-    return {
-      text,
-      keyboard,
-      sideEffect,
-      usedTools,
-      viaLlm: true,
-    };
+    return await attempt();
   } catch (error: unknown) {
-    console.error('[assistant/gemini] SDK error:', error);
-    // Si falló el call, sacar el user huérfano del historial para no ensuciar el próximo turno
+    console.error('[assistant/gemini] SDK error (reintentando sin historial):', error);
     try {
-      const hist = await getGeminiHistory(sessionId);
-      if (hist.length && hist[hist.length - 1]?.role === 'user') {
-        await replaceGeminiHistoryFromChat(sessionId, hist.slice(0, -1));
+      await clearGeminiHistory(sessionId);
+      return await attempt();
+    } catch (retryError: unknown) {
+      console.error('[assistant/gemini] SDK retry falló:', retryError);
+      try {
+        const hist = await getGeminiHistory(sessionId);
+        if (hist.length && hist[hist.length - 1]?.role === 'user') {
+          await replaceGeminiHistoryFromChat(sessionId, hist.slice(0, -1));
+        }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
+      return { text: '', keyboard: null, sideEffect: null, usedTools: [], viaLlm: false };
     }
-    return { text: '', keyboard: null, sideEffect: null, usedTools, viaLlm: false };
   }
 }

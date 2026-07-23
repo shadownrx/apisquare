@@ -5,7 +5,7 @@ export const ASSISTANT_TOOL_DEFINITIONS = [
     function: {
       name: 'get_clinic_info',
       description:
-        'Datos fijos de la clínica: horarios de atención, precios, ubicación, pago, obra social, qué traer, estacionamiento, duración o política de cancelación. Usala para preguntas generales (NO para el turno personal del paciente).',
+        'Datos fijos de la clínica: profesionales/médicos, horarios, precios, ubicación, pago, obra social, qué traer, estacionamiento, duración o cancelación. Usala para preguntas generales (NO para el turno personal del paciente).',
       parameters: {
         type: 'object',
         properties: {
@@ -21,9 +21,10 @@ export const ASSISTANT_TOOL_DEFINITIONS = [
               'estacionamiento',
               'duracion',
               'cancelacion',
+              'profesionales',
               'general',
             ],
-            description: 'Tema de la consulta',
+            description: 'Tema de la consulta. "qué médicos / quiénes atienden" → profesionales.',
           },
         },
         required: ['topic'],
