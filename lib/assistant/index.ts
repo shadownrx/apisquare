@@ -7,7 +7,7 @@ export {
   trimGeminiHistory,
   GEMINI_MAX_TURNS,
 } from './gemini-history';
-export { ASSISTANT_TOOL_DEFINITIONS } from './tool-defs';
+export { ASSISTANT_TOOL_DEFINITIONS, getActiveToolDefinitions } from './tool-defs';
 export { buildAppointmentsKeyboard, buildAppointmentsToolResult } from './appointments-ui';
 export {
   consumeGeminiRateLimit,
@@ -15,6 +15,7 @@ export {
   GEMINI_RATE_LIMIT_MAX,
   GEMINI_RATE_LIMIT_WINDOW_MS,
 } from './rate-limit';
+export { executeNamedTool, buildSystemPrompt } from './shared';
 export type {
   AppointmentsAction,
   AssistantKeyboard,

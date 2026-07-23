@@ -49,6 +49,11 @@ export function buildSystemPrompt(input: AssistantTurnInput): string {
     ? `Reserva en curso (interno): profesional=${input.draft.profesional || '-'}, servicio=${input.draft.servicio || '-'}, fecha=${input.draft.fecha || '-'}, hora=${input.draft.hora || '-'}, nombre=${input.draft.nombre || '-'}.`
     : 'No hay reserva en curso.';
 
+  const disabled = new Set(input.disabledTools || []);
+  const setNameLine = disabled.has('set_patient_name')
+    ? '- set_patient_name → NO disponible este turno. El usuario NO está dando su nombre; respondé la pregunta/comentario en prosa y pedí el nombre solo al final si hace falta.'
+    : '- set_patient_name → dijo su nombre y falta en el draft / needNombre';
+
   return `Sos el asistente de la clínica (quiropraxia y masajes, Tucumán) por Telegram.
 Escribís vos cada respuesta al paciente: natural, corta, rioplatense. Telegram Markdown (*negrita*) cuando ayude.
 Los botones son atajos del sistema; no hace falta repetir en el texto lo que ya está en el teclado.
@@ -56,7 +61,7 @@ Los botones son atajos del sistema; no hace falta repetir en el texto lo que ya 
 Usá tools para hechos. Nunca inventes cupos, precios ni turnos del paciente.
 - get_availability → cupos para un turno NUEVO (fecha YYYY-MM-DD; ventana → horaDesde/horaHasta; "a las 10" → horaPreferida)
 - hold_slot → eligió una hora concreta (no autotrabes desde get_availability)
-- set_patient_name → dijo su nombre y falta en el draft / needNombre
+${setNameLine}
 - confirm_booking → confirma (true) o cancela (false) el turno trabado; no digas "reservado" sin llamarla
 - get_my_appointments → SU turno (cuánto falta, cambiar, cancelar); no pidas un día nuevo
 - get_clinic_info → info general (profesionales, horarios, precios, etc.; NO cupos)
@@ -64,7 +69,7 @@ Usá tools para hechos. Nunca inventes cupos, precios ni turnos del paciente.
 Si la tool trae needServiceChoice / needNombre, pedí eso. recommendation = sugerencia, no elección del paciente.
 "mañana" = día siguiente; "por la mañana" = franja.
 Respondé siempre a lo que preguntó, aunque haya una reserva a medias.
-
+${input.turnHint ? `\n${input.turnHint}\n` : ''}
 Hoy en Argentina: ${getTodayStr()}.
 
 ${input.clinicContext}
@@ -90,8 +95,18 @@ function asHora(value: unknown): string | undefined {
 export async function executeNamedTool(
   name: string,
   rawArgs: string | Record<string, unknown>,
-  handlers: AssistantToolHandlers
+  handlers: AssistantToolHandlers,
+  disabledTools?: string[] | null
 ): Promise<ToolExecutionResult> {
+  if (disabledTools?.includes(name)) {
+    return {
+      data: {
+        error: `Tool ${name} no disponible en este turno`,
+        note: 'Respondé en prosa al paciente. No avances el flujo de reserva.',
+      },
+    };
+  }
+
   let args: Record<string, unknown> = {};
   if (typeof rawArgs === 'string') {
     try {

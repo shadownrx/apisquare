@@ -152,3 +152,10 @@ export const ASSISTANT_TOOL_DEFINITIONS = [
 ];
 
 export const ASSISTANT_TOOL_NAMES = ASSISTANT_TOOL_DEFINITIONS.map(t => t.function.name);
+
+/** Tools activas para un turno (omite disabledTools). */
+export function getActiveToolDefinitions(disabledTools?: string[] | null) {
+  if (!disabledTools?.length) return ASSISTANT_TOOL_DEFINITIONS;
+  const blocked = new Set(disabledTools);
+  return ASSISTANT_TOOL_DEFINITIONS.filter(t => !blocked.has(t.function.name));
+}

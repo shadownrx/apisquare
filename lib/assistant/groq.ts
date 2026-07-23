@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { ASSISTANT_TOOL_DEFINITIONS } from './tool-defs';
+import { getActiveToolDefinitions } from './tool-defs';
 import {
   MAX_TOOL_ROUNDS,
   buildSystemPrompt,
@@ -51,7 +51,7 @@ export async function runGroqAssistantTurn(
         {
           model,
           messages,
-          tools: ASSISTANT_TOOL_DEFINITIONS,
+          tools: getActiveToolDefinitions(input.disabledTools),
           tool_choice: 'auto',
           temperature: 0.4,
         },
@@ -80,7 +80,8 @@ export async function runGroqAssistantTurn(
           const result = await executeNamedTool(
             call.function.name,
             call.function.arguments || '{}',
-            input.handlers
+            input.handlers,
+            input.disabledTools
           );
           const merged = mergeToolUi(call.function.name, result, {
             keyboard,

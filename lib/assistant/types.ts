@@ -77,4 +77,8 @@ export type AssistantTurnInput = {
   draft: ConversationState;
   profileSummary?: string;
   handlers: AssistantToolHandlers;
+  /** Tools omitidas en este turno (ej. set_patient_name si el texto no es un nombre). */
+  disabledTools?: string[];
+  /** Nota extra para el system prompt de este turno. */
+  turnHint?: string;
 };

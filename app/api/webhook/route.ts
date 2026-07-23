@@ -4440,6 +4440,16 @@ export async function POST(request: NextRequest) {
         }
       }
 
+      // Nombre: solo avanzar con input válido local; preguntas → Gemini sin set_patient_name
+      let disableSetPatientName = false;
+      if (estado?.paso === 'nombre') {
+        if (isValidFlowInput(text, 'nombre')) {
+          await handleFlowNombreInput(chatId, estado, text, { saveState, sendWithKeyboard });
+          return NextResponse.json({ status: 'ok' });
+        }
+        disableSetPatientName = true;
+      }
+
       const flowCtx = { saveState, sendWithKeyboard };
       const logGeminiFallback = (reason: string) => {
         console.warn('[gemini-fallback]', {
@@ -4472,6 +4482,13 @@ export async function POST(request: NextRequest) {
                 ? `nombre=${profile.nombre || '-'}, ultimoTurno=${profile.lastProfesional || '-'}/${profile.lastServicio || '-'} (solo si pide repetir)`
                 : undefined,
               handlers: makeAssistantHandlers(chatId),
+              ...(disableSetPatientName
+                ? {
+                    disabledTools: ['set_patient_name'],
+                    turnHint:
+                      'Este mensaje NO es una respuesta de nombre para la reserva (es pregunta o comentario). No guardes nombre ni avances el flujo. Respondé en prosa y, si falta, pedí el nombre al final.',
+                  }
+                : {}),
             });
 
             if (
@@ -4483,6 +4500,8 @@ export async function POST(request: NextRequest) {
               })
             ) {
               const needsName =
+                !disableSetPatientName &&
+                isValidFlowInput(text, 'nombre') &&
                 (draftForAgent?.paso === 'nombre' ||
                   (draftForAgent?.hora &&
                     draftForAgent?.fecha &&
@@ -4597,7 +4616,16 @@ export async function POST(request: NextRequest) {
         }
 
         if (estado?.paso === 'nombre') {
-          if (await handleFlowNombreInput(chatId, estado, text, flowCtx)) {
+          if (isValidFlowInput(text, 'nombre')) {
+            if (await handleFlowNombreInput(chatId, estado, text, flowCtx)) {
+              return NextResponse.json({ status: 'ok' });
+            }
+          } else {
+            const contextKeyboard = await getContextualKeyboard(estado);
+            await sendWithKeyboard(
+              'Dale, ¿me confirmás tu nombre para la reserva? (ej: *María López*)',
+              contextKeyboard.length ? contextKeyboard : FLOW_CANCEL_KEYBOARD
+            );
             return NextResponse.json({ status: 'ok' });
           }
         }
@@ -4610,6 +4638,7 @@ export async function POST(request: NextRequest) {
           estado.paso !== 'profesional' &&
           estado.paso !== 'servicio' &&
           estado.paso !== 'fecha' &&
+          isValidFlowInput(text, 'nombre') &&
           extractPersonName(text)
         ) {
           if (
@@ -4769,7 +4798,14 @@ export async function POST(request: NextRequest) {
           }
 
         } else if (estado.paso === 'nombre') {
-          await handleFlowNombreInput(chatId, estado, text, { saveState, sendWithKeyboard });
+          if (isValidFlowInput(text, 'nombre')) {
+            await handleFlowNombreInput(chatId, estado, text, { saveState, sendWithKeyboard });
+          } else {
+            await sendWithKeyboard(
+              'Dale, ¿me confirmás tu nombre para la reserva? (ej: *María López*)',
+              FLOW_CANCEL_KEYBOARD
+            );
+          }
 
         } else if (estado.paso === 'fecha') {
           const fechaParseada = parseFecha(text);

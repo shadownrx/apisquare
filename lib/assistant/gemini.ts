@@ -7,7 +7,7 @@ import {
   type Part,
   type Schema,
 } from '@google/generative-ai';
-import { ASSISTANT_TOOL_DEFINITIONS } from './tool-defs';
+import { ASSISTANT_TOOL_DEFINITIONS, getActiveToolDefinitions } from './tool-defs';
 import {
   appendGeminiUserTurn,
   clearGeminiHistory,
@@ -17,8 +17,10 @@ import {
 import { MAX_TOOL_ROUNDS, buildSystemPrompt, executeNamedTool, mergeToolUi } from './shared';
 import type { AssistantKeyboard, AssistantSideEffect, AssistantTurnInput, AssistantTurnResult } from './types';
 
-function toGeminiFunctionDeclarations(): FunctionDeclaration[] {
-  return ASSISTANT_TOOL_DEFINITIONS.map(t => {
+function toGeminiFunctionDeclarations(
+  disabledTools?: string[] | null
+): FunctionDeclaration[] {
+  return getActiveToolDefinitions(disabledTools).map(t => {
     const params = t.function.parameters as {
       type: string;
       properties: Record<string, unknown>;
@@ -82,7 +84,7 @@ async function runGeminiChatTurn(
   const model = genAI.getGenerativeModel({
     model: modelName,
     systemInstruction,
-    tools: [{ functionDeclarations: toGeminiFunctionDeclarations() }],
+    tools: [{ functionDeclarations: toGeminiFunctionDeclarations(input.disabledTools) }],
     toolConfig: {
       functionCallingConfig: { mode: FunctionCallingMode.AUTO },
     },
@@ -115,7 +117,7 @@ async function runGeminiChatTurn(
         call.args && typeof call.args === 'object'
           ? (call.args as Record<string, unknown>)
           : {};
-      const toolResult = await executeNamedTool(call.name, args, input.handlers);
+      const toolResult = await executeNamedTool(call.name, args, input.handlers, input.disabledTools);
       const merged = mergeToolUi(call.name, toolResult, {
         keyboard: ui.keyboard ?? null,
         sideEffect: ui.sideEffect,
