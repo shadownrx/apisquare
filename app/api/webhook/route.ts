@@ -72,6 +72,9 @@ import type { ConversationState, Reservation, StatePatch } from '@/lib/types';
 import { getUserProfile, saveUserProfile } from '@/lib/user-profile';
 import { getWaitlistEntry, joinWaitlist, notifyWaitlistForDay } from '@/lib/waitlist';
 
+/** Vercel: Gemini + tools pueden superar el default de 10s. */
+export const maxDuration = 60;
+
 interface AIResponse {
   responseText: string;
   intent: BotIntent;
