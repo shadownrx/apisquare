@@ -67,6 +67,7 @@ import {
 } from '@/lib/googleCalendar';
 import { extractHoraCandidates, looksLikeHoraInput, parseHoraSelection } from '@/lib/parse-hora';
 import { addDays, dayOfWeekFromFechaStr, getNowMinutesInArgentina, getToday, getTodayStr, parseFecha, toDateStr } from '@/lib/parse-fecha';
+import { isNombreConfirmadoEnDraft } from '@/lib/nombre-confirm';
 import { notifyStaff } from '@/lib/staff-notify';
 import type { ConversationState, Reservation, StatePatch } from '@/lib/types';
 import { getUserProfile, saveUserProfile } from '@/lib/user-profile';
@@ -805,8 +806,8 @@ async function resolvePatientNombre(
 }
 
 /**
- * Después de elegir hora: pedir nombre si falta; si no, ir a confirmar.
- * Evita reservar con nombre undefined.
+ * Después de elegir hora: pedir/confirmar nombre si falta en ESTE draft;
+ * solo ir a confirmar turno si nombreConfirmado=true.
  */
 async function proceedAfterSlotChosen(
   chatId: number,
@@ -815,25 +816,28 @@ async function proceedAfterSlotChosen(
   saveState: (patch: StatePatch) => Promise<void>,
   sendWithKeyboard: (text: string, keyboard: any) => Promise<void>
 ) {
-  const nombre = await resolvePatientNombre(chatId, estado);
   const base = { ...estado, hora };
 
-  if (!nombre) {
-    await saveState({
-      ...base,
-      paso: 'nombre',
-      clear: ['nombre'],
-    });
-    await sendWithKeyboard(
-      'Dale, ¿a nombre de quién reservo el turno?\n\nEscribí tu nombre (ej: *María López*).',
-      FLOW_CANCEL_KEYBOARD
-    );
+  if (isNombreConfirmadoEnDraft(estado)) {
+    const nombre = sanitizePersonName(estado.nombre)!;
+    await saveState({ ...base, paso: 'confirmar', nombre, nombreConfirmado: true });
+    const view = await buildConfirmacionView({ ...base, nombre });
+    await sendWithKeyboard(view.text, view.keyboard);
     return;
   }
 
-  await saveState({ ...base, paso: 'confirmar', nombre });
-  const view = await buildConfirmacionView({ ...base, nombre });
-  await sendWithKeyboard(view.text, view.keyboard);
+  // KV puede tener nombre, pero hay que confirmar con botones (buildNombreStep).
+  const step = await buildNombreStep(base, chatId);
+  await saveState({
+    ...step.estado,
+    hora,
+    ...(base.fecha ? { fecha: base.fecha } : {}),
+    ...(base.profesional ? { profesional: base.profesional } : {}),
+    ...(base.servicio ? { servicio: base.servicio } : {}),
+    ...(base.rescheduleId ? { rescheduleId: base.rescheduleId } : {}),
+    clear: ['nombreConfirmado', ...(step.estado.clear || [])],
+  });
+  await sendWithKeyboard(step.text, step.keyboard);
 }
 
 type AvailabilityToolData = {
@@ -882,6 +886,7 @@ async function mergeDraftFromSideEffect(
     ...(draft.profesional ? { profesional: draft.profesional } : {}),
     ...(draft.servicio ? { servicio: draft.servicio } : {}),
     ...(draft.nombre ? { nombre: draft.nombre } : {}),
+    ...(draft.nombreConfirmado ? { nombreConfirmado: true } : {}),
     ...(draft.fecha ? { fecha: draft.fecha } : {}),
     ...(draft.hora ? { hora: draft.hora } : {}),
     ...(draft.rescheduleId ? { rescheduleId: draft.rescheduleId } : {}),
@@ -1105,11 +1110,21 @@ async function handleFlowNombreInput(
   await saveUserProfile(chatId, nombre, kv);
 
   if (estado.fecha && estado.hora && estado.profesional && estado.servicio) {
-    await ctx.saveState({ ...estado, paso: 'confirmar', nombre });
+    await ctx.saveState({
+      ...estado,
+      paso: 'confirmar',
+      nombre,
+      nombreConfirmado: true,
+    });
     const view = await buildConfirmacionView({ ...estado, nombre });
     await ctx.sendWithKeyboard(`Perfecto, *${nombre}* 👋\n\n${view.text}`, view.keyboard);
   } else {
-    await ctx.saveState({ ...estado, paso: 'fecha', nombre });
+    await ctx.saveState({
+      ...estado,
+      paso: 'fecha',
+      nombre,
+      nombreConfirmado: true,
+    });
     const view = await buildFechasView(estado.servicio, estado.profesional);
     await ctx.sendWithKeyboard(`Hola *${nombre}* 👋\n\n${view.text}`, view.keyboard);
   }
@@ -2119,7 +2134,7 @@ async function buildNombreStep(estado: ConversationState, chatId: number, prefix
 
   const { nombre: _omitNombre, ...rest } = estado;
   return {
-    estado: { ...rest, paso: 'nombre', clear: ['nombre'] } as StatePatch,
+    estado: { ...rest, paso: 'nombre', clear: ['nombre', 'nombreConfirmado'] } as StatePatch,
     text: withFlowProgress('nombre', `${prefix}¿Cuál es tu nombre?`),
     keyboard: FLOW_CANCEL_KEYBOARD
   };
@@ -2601,14 +2616,24 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
       };
     }
 
-    const nombre = await resolvePatientNombre(chatId, estado, args.nombre);
     const isReschedule = Boolean(estado.rescheduleId);
 
-    if (!nombre) {
+    // Solo saltear confirmación si el usuario ya confirmó en ESTE draft.
+    // El nombre en KV (o args.nombre sugerido) NUNCA alcanza para ir a confirmar.
+    if (!isNombreConfirmadoEnDraft(estado)) {
+      const stepBase: ConversationState = {
+        ...estado,
+        profesional,
+        servicio,
+        fecha,
+        hora,
+      };
+      const step = await buildNombreStep(stepBase, chatId);
       return {
         data: {
           held: true,
           needNombre: true,
+          needNombreConfirm: Boolean(sanitizePersonName(step.estado.nombre)),
           fecha,
           fechaLabel: formatDateAR(fecha),
           weekday: DAY_NAMES[dayOfWeekFromFechaStr(fecha)],
@@ -2616,24 +2641,25 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
           servicio,
           hora,
           note:
-            'Turno trabado. Pedí el nombre del paciente. En el próximo mensaje llamá set_patient_name. No digas "undefined".',
+            'Turno trabado. Pedí o confirmá el nombre con los botones (usar_nombre / cambiar_nombre) o que escriba el nombre. No digas "undefined". No asumas el nombre del perfil.',
         },
-        keyboard: [[BTN.CANCEL_FLOW], [BTN.MENU]],
+        keyboard: step.keyboard,
         sideEffect: {
           type: 'set_draft',
           draft: {
-            paso: 'nombre',
+            ...step.estado,
             profesional,
             servicio,
             fecha,
             hora,
-            clear: ['nombre'],
+            clear: ['nombreConfirmado', ...(step.estado.clear || [])],
             ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
           },
         },
       };
     }
 
+    const nombreFinal = sanitizePersonName(estado.nombre)!;
     return {
       data: {
         held: true,
@@ -2645,7 +2671,7 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
         profesional,
         servicio,
         hora,
-        nombre,
+        nombre: nombreFinal,
         isReschedule,
         note: 'Turno listo para confirmar. Escribí vos el resumen; el teclado tiene Confirmar.',
       },
@@ -2658,7 +2684,8 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
           servicio,
           fecha,
           hora,
-          nombre,
+          nombre: nombreFinal,
+          nombreConfirmado: true,
           ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
         },
       },
@@ -2687,6 +2714,7 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
             ...(estado.fecha ? { fecha: estado.fecha } : {}),
             ...(estado.hora ? { hora: estado.hora } : {}),
             ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
+            clear: ['nombreConfirmado'],
           },
         },
       };
@@ -2721,6 +2749,7 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
             fecha: estado.fecha,
             hora: estado.hora,
             nombre,
+            nombreConfirmado: true,
             ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
           },
         },
@@ -2749,6 +2778,7 @@ function makeAssistantHandlers(chatId: number): AssistantToolHandlers {
         draft: {
           paso: 'fecha',
           nombre,
+          nombreConfirmado: true,
           ...(estado.profesional ? { profesional: estado.profesional } : {}),
           ...(estado.servicio ? { servicio: estado.servicio } : {}),
           ...(estado.rescheduleId ? { rescheduleId: estado.rescheduleId } : {}),
@@ -3774,17 +3804,17 @@ export async function POST(request: NextRequest) {
         if (!estado.nombre || !estado.servicio || !estado.profesional) {
           await sendWithKeyboard('Sigamos desde el principio:', await buildProfesionalesKeyboard());
         } else if (estado.fecha && estado.hora) {
-          await saveState({ ...estado, paso: 'confirmar' });
+          await saveState({ ...estado, paso: 'confirmar', nombreConfirmado: true });
           const view = await buildConfirmacionView(estado);
           await sendWithKeyboard(`Perfecto, *${estado.nombre}* 👋\n\n${view.text}`, view.keyboard);
         } else {
-          await saveState({ ...estado, paso: 'fecha' });
+          await saveState({ ...estado, paso: 'fecha', nombreConfirmado: true });
           const view = await buildFechasView(estado.servicio, estado.profesional);
           await sendWithKeyboard(`Perfecto, *${estado.nombre}* 👋\n\n${view.text}`, view.keyboard);
         }
 
       } else if (data === 'cambiar_nombre') {
-        await saveState({ paso: 'nombre', clear: ['nombre'] });
+        await saveState({ paso: 'nombre', clear: ['nombre', 'nombreConfirmado'] });
         await sendWithKeyboard(
           withFlowProgress('nombre', 'Dale, ¿cuál es tu nombre?'),
           FLOW_CANCEL_KEYBOARD

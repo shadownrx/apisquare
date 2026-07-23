@@ -26,6 +26,8 @@ export interface ConversationState {
   profesional?: string;
   servicio?: string;
   nombre?: string;
+  /** true solo si el usuario confirmó el nombre en ESTE draft (usar_nombre o texto válido). */
+  nombreConfirmado?: boolean;
   fecha?: string;
   hora?: string;
   rescheduleId?: string;
